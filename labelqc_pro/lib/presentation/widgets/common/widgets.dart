@@ -129,7 +129,7 @@ class ParameterRow extends StatelessWidget {
               color: AppColors.textSecondary,
             ),
           ),
-          const SizedBox(width: 10);
+          const SizedBox(width: 10),
           SizedBox(
             width: 60,
             height: 4,

@@ -55,7 +55,7 @@ class _TechnicalScanScreenState extends State<TechnicalScanScreen> {
         rawValue: barcode0.rawValue,
         symbology: type,
         corners: barcode0.corners,
-        boundingBox: barcode0.boundingBox,
+        boundingBox: _cornersToRect(barcode0.corners),
         captureSize: capture.size,
         imageBytes: capture.image,
       );
@@ -91,6 +91,19 @@ class _TechnicalScanScreenState extends State<TechnicalScanScreen> {
     } catch (e) {
       if (mounted) setState(() => _isAnalyzing = false);
     }
+  }
+
+  Rect? _cornersToRect(List<Offset>? corners) {
+    if (corners == null || corners.isEmpty) return null;
+    double minX = corners[0].dx, maxX = corners[0].dx;
+    double minY = corners[0].dy, maxY = corners[0].dy;
+    for (final c in corners) {
+      if (c.dx < minX) minX = c.dx;
+      if (c.dx > maxX) maxX = c.dx;
+      if (c.dy < minY) minY = c.dy;
+      if (c.dy > maxY) maxY = c.dy;
+    }
+    return Rect.fromLTRB(minX, minY, maxX, maxY);
   }
 
   BarcodeType _mapFormat(BarcodeFormat f) {
