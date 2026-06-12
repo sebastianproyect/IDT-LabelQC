@@ -26,6 +26,7 @@ class _TechnicalScanScreenState extends State<TechnicalScanScreen> {
     detectionSpeed: DetectionSpeed.noDuplicates,
     facing: CameraFacing.back,
     formats: [BarcodeFormat.all],
+    returnImage: true,
   );
 
   bool _torchOn = false;

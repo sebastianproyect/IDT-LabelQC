@@ -22,6 +22,7 @@ class _ProductionScanScreenState extends State<ProductionScanScreen>
     detectionSpeed: DetectionSpeed.noDuplicates,
     facing: CameraFacing.back,
     formats: [BarcodeFormat.all],
+    returnImage: true,
   );
 
   bool _torchOn = false;
