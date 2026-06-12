@@ -5,6 +5,9 @@ on:
     branches: [ master, main ]
   workflow_dispatch:
 
+permissions:
+  contents: write
+
 jobs:
   build:
     runs-on: ubuntu-latest
@@ -33,9 +36,21 @@ jobs:
         working-directory: labelqc_pro
         run: flutter build apk --release
 
-      - name: Upload APK
-        uses: actions/upload-artifact@v4
+      - name: Rename APK
+        run: mv labelqc_pro/build/app/outputs/flutter-apk/app-release.apk IDT-LabelQC.apk
+
+      - name: Create Release
+        uses: softprops/action-gh-release@v2
         with:
-          name: IDT-LabelQC-APK
-          path: labelqc_pro/build/app/outputs/flutter-apk/app-release.apk
-          retention-days: 30
+          tag_name: v1.0-build-${{ github.run_number }}
+          name: "IDT LabelQC v1.0 (build ${{ github.run_number }})"
+          body: |
+            ## Descarga e instala la app
+
+            1. Descarga el archivo **IDT-LabelQC.apk**
+            2. En tu Android: Ajustes → Seguridad → Fuentes desconocidas → Activar
+            3. Abre el APK y sigue los pasos
+            4. Usuario: `admin` | Contraseña: `admin123`
+          files: IDT-LabelQC.apk
+          draft: false
+          prerelease: false
