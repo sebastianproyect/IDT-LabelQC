@@ -102,6 +102,25 @@ class ParameterRow extends StatelessWidget {
               ),
             ),
           ),
+          if (value.isEstimated)
+            Padding(
+              padding: const EdgeInsets.only(right: 6),
+              child: Tooltip(
+                message: value.estimationBasis ?? 'Valor estimado',
+                child: Container(
+                  padding: const EdgeInsets.symmetric(horizontal: 4, vertical: 2),
+                  decoration: BoxDecoration(
+                    color: const Color(0xFF2A2400),
+                    borderRadius: BorderRadius.circular(3),
+                    border: Border.all(color: const Color(0xFFF5A623).withOpacity(0.4)),
+                  ),
+                  child: const Text('~est.', style: TextStyle(
+                    fontSize: 9, color: Color(0xFFF5A623),
+                    fontWeight: FontWeight.w600, letterSpacing: 0.3,
+                  )),
+                ),
+              ),
+            ),
           Text(
             value.formattedValue,
             style: const TextStyle(
@@ -110,7 +129,7 @@ class ParameterRow extends StatelessWidget {
               color: AppColors.textSecondary,
             ),
           ),
-          const SizedBox(width: 10),
+          const SizedBox(width: 10);
           SizedBox(
             width: 60,
             height: 4,

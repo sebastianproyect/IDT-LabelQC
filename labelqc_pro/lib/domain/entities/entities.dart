@@ -1,5 +1,6 @@
 import 'dart:math';
 import 'dart:typed_data';
+import 'dart:ui';
 import 'package:equatable/equatable.dart';
 
 // ══════════════════════════════
@@ -71,12 +72,16 @@ class GradeValue extends Equatable {
   final String unit;
   final ISOGrade grade;
   final double numericGrade;
+  final bool isEstimated;
+  final String? estimationBasis;
 
   const GradeValue({
     required this.rawMeasurement,
     required this.unit,
     required this.grade,
     required this.numericGrade,
+    this.isEstimated = false,
+    this.estimationBasis,
   });
 
   String get formattedValue {
@@ -91,6 +96,8 @@ class GradeValue extends Equatable {
         'unit': unit,
         'grade': grade.letter,
         'numeric': numericGrade,
+        'est': isEstimated,
+        if (estimationBasis != null) 'estBasis': estimationBasis,
       };
 
   static GradeValue fromJson(Map<String, dynamic> j) => GradeValue(
@@ -98,10 +105,33 @@ class GradeValue extends Equatable {
         unit: j['unit'] as String,
         grade: ISOGrade.fromLetter(j['grade'] as String),
         numericGrade: (j['numeric'] as num).toDouble(),
+        isEstimated: (j['est'] as bool?) ?? false,
+        estimationBasis: j['estBasis'] as String?,
       );
 
   @override
-  List<Object?> get props => [rawMeasurement, unit, grade];
+  List<Object?> get props => [rawMeasurement, unit, grade, isEstimated];
+}
+
+// ══════════════════════════════
+// BARCODE ANALYSIS INPUT
+// ══════════════════════════════
+class BarcodeAnalysisInput {
+  final String? rawValue;
+  final BarcodeType symbology;
+  final List<Offset>? corners;
+  final Rect? boundingBox;
+  final Size captureSize;
+  final Uint8List? imageBytes;
+
+  const BarcodeAnalysisInput({
+    this.rawValue,
+    required this.symbology,
+    this.corners,
+    this.boundingBox,
+    required this.captureSize,
+    this.imageBytes,
+  });
 }
 
 // ══════════════════════════════

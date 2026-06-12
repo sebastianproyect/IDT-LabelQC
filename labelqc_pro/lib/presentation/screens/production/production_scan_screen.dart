@@ -2,14 +2,11 @@ import 'package:flutter/material.dart';
 import 'package:flutter/services.dart';
 import 'package:mobile_scanner/mobile_scanner.dart' hide BarcodeType;
 import 'package:go_router/go_router.dart';
-import 'package:image/image.dart' as img;
 import '../../../core/theme/app_theme.dart';
 import '../../widgets/common/widgets.dart';
 import '../../../domain/entities/entities.dart';
 import '../../../services/iso/iso_analyzers.dart';
 import '../../../services/spc/spc_and_recommendations.dart';
-import 'dart:typed_data';
-import 'dart:math' show min, max;
 
 class ProductionScanScreen extends StatefulWidget {
   const ProductionScanScreen({super.key});
@@ -61,25 +58,19 @@ class _ProductionScanScreenState extends State<ProductionScanScreen>
     setState(() => _isAnalyzing = true);
 
     try {
-      final imageBytes = capture.image;
-      final analysisBytes = imageBytes != null
-          ? _cropToBarcodeRegion(imageBytes, barcode, capture.size)
-          : Uint8List(0);
       final type = _mapFormat(barcode.format);
+      final input = BarcodeAnalysisInput(
+        rawValue: barcode.rawValue,
+        symbology: type,
+        corners: barcode.corners,
+        boundingBox: barcode.boundingBox,
+        captureSize: capture.size,
+        imageBytes: capture.image,
+      );
 
-      ISOParameters params;
-      if (type.is2D) {
-        params = _analyzer2D.analyze(
-          imageBytes: analysisBytes,
-          symbology: type,
-          decodedValue: barcode.rawValue!,
-        );
-      } else {
-        params = _analyzer1D.analyze(
-          imageBytes: analysisBytes,
-          symbology: type,
-        );
-      }
+      final params = type.is2D
+          ? _analyzer2D.analyze(input)
+          : _analyzer1D.analyze(input);
 
       final recs = _recEngine.generate(verification: BarcodeVerification(
         id: '', timestamp: DateTime.now(), symbology: type,
@@ -96,7 +87,7 @@ class _ProductionScanScreenState extends State<ProductionScanScreen>
         standard: type.standard,
         parameters: params,
         overallGrade: params.overallGrade,
-        capturedImage: imageBytes,
+        capturedImage: capture.image,
         captureMode: OperatorMode.production,
         recommendations: recs,
       );
@@ -130,43 +121,6 @@ class _ProductionScanScreenState extends State<ProductionScanScreen>
         _lastResult = null;
       });
     });
-  }
-
-  Uint8List _cropToBarcodeRegion(Uint8List rawImage, Barcode barcode, Size captureSize) {
-    final full = img.decodeImage(rawImage);
-    if (full == null) return rawImage;
-
-    double minX, minY, bW, bH;
-
-    final corners = barcode.corners;
-    if (corners != null && corners.length >= 2) {
-      final scaleX = captureSize.width > 0 ? full.width / captureSize.width : 1.0;
-      final scaleY = captureSize.height > 0 ? full.height / captureSize.height : 1.0;
-      final xs = corners.map((c) => c.dx * scaleX).toList();
-      final ys = corners.map((c) => c.dy * scaleY).toList();
-      minX = xs.reduce(min); minY = ys.reduce(min);
-      bW = xs.reduce(max) - minX;
-      bH = ys.reduce(max) - minY;
-    } else {
-      final bb = barcode.boundingBox;
-      if (bb == null) return rawImage;
-      final scaleX = captureSize.width > 0 ? full.width / captureSize.width : 1.0;
-      final scaleY = captureSize.height > 0 ? full.height / captureSize.height : 1.0;
-      minX = bb.left * scaleX; minY = bb.top * scaleY;
-      bW = bb.width * scaleX;  bH = bb.height * scaleY;
-    }
-
-    if (bW < 5 || bH < 5) return rawImage;
-
-    const pad = 0.5;
-    final x = (minX - bW * pad).clamp(0.0, full.width - 2.0).toInt();
-    final y = (minY - bH * pad).clamp(0.0, full.height - 2.0).toInt();
-    final w = (bW * (1 + pad * 2)).clamp(1.0, (full.width - x).toDouble()).toInt();
-    final h = (bH * (1 + pad * 2)).clamp(1.0, (full.height - y).toDouble()).toInt();
-    if (w < 20 || h < 10) return rawImage;
-
-    final cropped = img.copyCrop(full, x: x, y: y, width: w, height: h);
-    return Uint8List.fromList(img.encodeJpg(cropped, quality: 95));
   }
 
   BarcodeType _mapFormat(BarcodeFormat f) {
