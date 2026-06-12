@@ -38,16 +38,31 @@ class ISO15416Analyzer {
     );
   }
 
-  /// Extract 1D reflectance profile from grayscale center scanline
+  /// Extract 1D reflectance profile from the highest-contrast scanline
   _ScanProfile _extractScanProfile(img.Image image) {
-    // Convert to grayscale
     final gray = img.grayscale(image);
-    final midY = gray.height ~/ 2;
 
-    // Sample multiple scanlines for robustness
+    // Find the row with the highest contrast (where the barcode actually is)
+    int bestY = gray.height ~/ 2;
+    double bestContrast = 0;
+    const scanStep = 3;
+    for (int y = scanStep; y < gray.height - scanStep; y += scanStep) {
+      double rMax = 0.0, rMin = 1.0;
+      for (int x = 0; x < gray.width; x++) {
+        final lum = img.getLuminance(gray.getPixel(x, y)) / 255.0;
+        if (lum > rMax) rMax = lum;
+        if (lum < rMin) rMin = lum;
+      }
+      if (rMax - rMin > bestContrast) {
+        bestContrast = rMax - rMin;
+        bestY = y;
+      }
+    }
+
+    // Sample multiple scanlines around bestY for robustness
     final profiles = <List<double>>[];
     for (int dy = -2; dy <= 2; dy++) {
-      final y = (midY + dy).clamp(0, gray.height - 1);
+      final y = (bestY + dy).clamp(0, gray.height - 1);
       final line = <double>[];
       for (int x = 0; x < gray.width; x++) {
         final pixel = gray.getPixel(x, y);

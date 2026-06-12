@@ -2,12 +2,14 @@ import 'package:flutter/material.dart';
 import 'package:flutter/services.dart';
 import 'package:mobile_scanner/mobile_scanner.dart' hide BarcodeType;
 import 'package:go_router/go_router.dart';
+import 'package:image/image.dart' as img;
 import '../../../core/theme/app_theme.dart';
 import '../../widgets/common/widgets.dart';
 import '../../../domain/entities/entities.dart';
 import '../../../services/iso/iso_analyzers.dart';
 import '../../../services/spc/spc_and_recommendations.dart';
 import 'dart:typed_data';
+import 'dart:math' show min, max;
 
 class ProductionScanScreen extends StatefulWidget {
   const ProductionScanScreen({super.key});
@@ -60,18 +62,21 @@ class _ProductionScanScreenState extends State<ProductionScanScreen>
 
     try {
       final imageBytes = capture.image;
+      final analysisBytes = imageBytes != null
+          ? _cropToBarcodeRegion(imageBytes, barcode, capture.size)
+          : Uint8List(0);
       final type = _mapFormat(barcode.format);
-      
+
       ISOParameters params;
       if (type.is2D) {
         params = _analyzer2D.analyze(
-          imageBytes: imageBytes ?? Uint8List(0),
+          imageBytes: analysisBytes,
           symbology: type,
           decodedValue: barcode.rawValue!,
         );
       } else {
         params = _analyzer1D.analyze(
-          imageBytes: imageBytes ?? Uint8List(0),
+          imageBytes: analysisBytes,
           symbology: type,
         );
       }
@@ -125,6 +130,32 @@ class _ProductionScanScreenState extends State<ProductionScanScreen>
         _lastResult = null;
       });
     });
+  }
+
+  Uint8List _cropToBarcodeRegion(Uint8List rawImage, Barcode barcode, Size captureSize) {
+    final corners = barcode.corners;
+    if (corners == null || corners.length < 2) return rawImage;
+    final full = img.decodeImage(rawImage);
+    if (full == null) return rawImage;
+
+    final scaleX = captureSize.width > 0 ? full.width / captureSize.width : 1.0;
+    final scaleY = captureSize.height > 0 ? full.height / captureSize.height : 1.0;
+
+    final xs = corners.map((c) => c.dx * scaleX).toList();
+    final ys = corners.map((c) => c.dy * scaleY).toList();
+    final bW = xs.reduce(max) - xs.reduce(min);
+    final bH = ys.reduce(max) - ys.reduce(min);
+    if (bW < 5 || bH < 5) return rawImage;
+
+    const pad = 0.4;
+    final x = (xs.reduce(min) - bW * pad).clamp(0.0, full.width - 2.0).toInt();
+    final y = (ys.reduce(min) - bH * pad).clamp(0.0, full.height - 2.0).toInt();
+    final w = (bW * (1 + pad * 2)).clamp(1.0, (full.width - x).toDouble()).toInt();
+    final h = (bH * (1 + pad * 2)).clamp(1.0, (full.height - y).toDouble()).toInt();
+    if (w < 20 || h < 10) return rawImage;
+
+    final cropped = img.copyCrop(full, x: x, y: y, width: w, height: h);
+    return Uint8List.fromList(img.encodeJpg(cropped, quality: 95));
   }
 
   BarcodeType _mapFormat(BarcodeFormat f) {
