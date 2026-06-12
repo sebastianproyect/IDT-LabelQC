@@ -200,7 +200,7 @@ class SPCAnalyzer {
     }
 
     return DegradationForecast(
-      slope: slope,
+      slope: slope.toDouble(),
       isDecreasing: slope < -0.05,
       estimatedControlsToGradeD: controlsToD,
       confidence: r2.clamp(0, 1).toDouble(),

@@ -363,7 +363,7 @@ class _TrendChart extends StatelessWidget {
                     leftTitles: AxisTitles(sideTitles: SideTitles(
                       showTitles: true, interval: 1, reservedSize: 24,
                       getTitlesWidget: (v, _) {
-                        const labels = {1.0: 'D', 2.0: 'C', 3.0: 'B', 4.0: 'A'};
+                        final labels = {1.0: 'D', 2.0: 'C', 3.0: 'B', 4.0: 'A'};
                         return Text(labels[v] ?? '', style: const TextStyle(
                           fontSize: 10, fontFamily: 'JetBrainsMono',
                           color: AppColors.textSecondary, fontWeight: FontWeight.w700,

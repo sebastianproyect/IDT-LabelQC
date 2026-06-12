@@ -1,6 +1,6 @@
 import 'package:flutter/material.dart';
 import 'package:flutter/services.dart';
-import 'package:mobile_scanner/mobile_scanner.dart';
+import 'package:mobile_scanner/mobile_scanner.dart' hide BarcodeType;
 import 'package:go_router/go_router.dart';
 import '../../../core/theme/app_theme.dart';
 import '../../widgets/common/widgets.dart';
@@ -21,7 +21,7 @@ class _ProductionScanScreenState extends State<ProductionScanScreen>
   final MobileScannerController _scanner = MobileScannerController(
     detectionSpeed: DetectionSpeed.noDuplicates,
     facing: CameraFacing.back,
-    formats: BarcodeFormat.all,
+    formats: [BarcodeFormat.all],
   );
 
   bool _torchOn = false;
