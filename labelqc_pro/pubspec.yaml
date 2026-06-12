@@ -1,0 +1,61 @@
+name: idtlabelqc
+description: IDT LabelQC - Professional barcode quality verification platform
+publish_to: 'none'
+version: 1.0.0+1
+
+environment:
+  sdk: '>=3.2.0 <4.0.0'
+  flutter: '>=3.16.0'
+
+dependencies:
+  flutter:
+    sdk: flutter
+
+  # Navigation
+  go_router: ^14.2.7
+
+  # Barcode scanning
+  mobile_scanner: ^5.2.3
+
+  # Image processing
+  image: ^4.1.7
+
+  # Database - sqflite (no code gen needed)
+  sqflite: ^2.3.3+1
+  path_provider: ^2.1.3
+  path: ^1.9.0
+
+  # State
+  equatable: ^2.0.5
+  get_it: ^7.7.0
+
+  # PDF
+  pdf: ^3.11.1
+  printing: ^5.13.2
+
+  # Charts
+  fl_chart: ^0.68.0
+
+  # Export & Share
+  share_plus: ^9.0.0
+
+  # Security
+  crypto: ^3.0.3
+
+  # Utils
+  uuid: ^4.4.2
+  intl: ^0.19.0
+
+  # Permissions
+  permission_handler: ^11.3.1
+
+dev_dependencies:
+  flutter_test:
+    sdk: flutter
+  flutter_lints: ^4.0.0
+
+flutter:
+  uses-material-design: true
+  assets:
+    - assets/images/
+    - assets/sounds/
