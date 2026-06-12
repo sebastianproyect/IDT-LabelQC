@@ -42,19 +42,30 @@ class ISO15416Analyzer {
   _ScanProfile _extractScanProfile(img.Image image) {
     final gray = img.grayscale(image);
 
-    // Find the row with the highest contrast (where the barcode actually is)
+    // Find the barcode row: the row with the most light/dark transitions
     int bestY = gray.height ~/ 2;
-    double bestContrast = 0;
-    const scanStep = 3;
+    int bestTransitions = 0;
+    const scanStep = 2;
     for (int y = scanStep; y < gray.height - scanStep; y += scanStep) {
       double rMax = 0.0, rMin = 1.0;
+      final rowLum = <double>[];
       for (int x = 0; x < gray.width; x++) {
         final lum = img.getLuminance(gray.getPixel(x, y)) / 255.0;
+        rowLum.add(lum);
         if (lum > rMax) rMax = lum;
         if (lum < rMin) rMin = lum;
       }
-      if (rMax - rMin > bestContrast) {
-        bestContrast = rMax - rMin;
+      final contrast = rMax - rMin;
+      if (contrast < 0.15) continue; // skip flat rows (no barcode here)
+      final thresh = rMin + contrast * 0.5;
+      int transitions = 0;
+      bool above = rowLum[0] > thresh;
+      for (int x = 1; x < rowLum.length; x++) {
+        final nowAbove = rowLum[x] > thresh;
+        if (nowAbove != above) { transitions++; above = nowAbove; }
+      }
+      if (transitions > bestTransitions) {
+        bestTransitions = transitions;
         bestY = y;
       }
     }

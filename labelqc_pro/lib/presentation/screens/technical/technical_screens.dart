@@ -104,23 +104,34 @@ class _TechnicalScanScreenState extends State<TechnicalScanScreen> {
   }
 
   Uint8List _cropToBarcodeRegion(Uint8List rawImage, Barcode barcode, Size captureSize) {
-    final corners = barcode.corners;
-    if (corners == null || corners.length < 2) return rawImage;
     final full = img.decodeImage(rawImage);
     if (full == null) return rawImage;
 
-    final scaleX = captureSize.width > 0 ? full.width / captureSize.width : 1.0;
-    final scaleY = captureSize.height > 0 ? full.height / captureSize.height : 1.0;
+    double minX, minY, bW, bH;
 
-    final xs = corners.map((c) => c.dx * scaleX).toList();
-    final ys = corners.map((c) => c.dy * scaleY).toList();
-    final bW = xs.reduce(max) - xs.reduce(min);
-    final bH = ys.reduce(max) - ys.reduce(min);
+    final corners = barcode.corners;
+    if (corners != null && corners.length >= 2) {
+      final scaleX = captureSize.width > 0 ? full.width / captureSize.width : 1.0;
+      final scaleY = captureSize.height > 0 ? full.height / captureSize.height : 1.0;
+      final xs = corners.map((c) => c.dx * scaleX).toList();
+      final ys = corners.map((c) => c.dy * scaleY).toList();
+      minX = xs.reduce(min); minY = ys.reduce(min);
+      bW = xs.reduce(max) - minX;
+      bH = ys.reduce(max) - minY;
+    } else {
+      final bb = barcode.boundingBox;
+      if (bb == null) return rawImage;
+      final scaleX = captureSize.width > 0 ? full.width / captureSize.width : 1.0;
+      final scaleY = captureSize.height > 0 ? full.height / captureSize.height : 1.0;
+      minX = bb.left * scaleX; minY = bb.top * scaleY;
+      bW = bb.width * scaleX;  bH = bb.height * scaleY;
+    }
+
     if (bW < 5 || bH < 5) return rawImage;
 
-    const pad = 0.4;
-    final x = (xs.reduce(min) - bW * pad).clamp(0.0, full.width - 2.0).toInt();
-    final y = (ys.reduce(min) - bH * pad).clamp(0.0, full.height - 2.0).toInt();
+    const pad = 0.5;
+    final x = (minX - bW * pad).clamp(0.0, full.width - 2.0).toInt();
+    final y = (minY - bH * pad).clamp(0.0, full.height - 2.0).toInt();
     final w = (bW * (1 + pad * 2)).clamp(1.0, (full.width - x).toDouble()).toInt();
     final h = (bH * (1 + pad * 2)).clamp(1.0, (full.height - y).toDouble()).toInt();
     if (w < 20 || h < 10) return rawImage;
