@@ -1,4 +1,5 @@
 import 'dart:math';
+import 'dart:typed_data';
 import 'dart:ui';
 import 'package:image/image.dart' as img;
 import '../../domain/entities/entities.dart';
@@ -122,7 +123,7 @@ class ISO15416Analyzer {
   // ── JPEG path ────────────────────────────────────────────────────────────
 
   _ScanProfile? _profileFromJpeg(List<int> bytes, BarcodeAnalysisInput input) {
-    final decoded = img.decodeImage(bytes);
+    final decoded = img.decodeImage(bytes is Uint8List ? bytes : Uint8List.fromList(bytes));
     if (decoded == null) return null;
 
     final imgW = decoded.width;
@@ -476,7 +477,7 @@ class ISO15415Analyzer {
   }
 
   _2DMetrics? _metricsFromJpeg(List<int> bytes, BarcodeAnalysisInput input) {
-    final decoded = img.decodeImage(bytes);
+    final decoded = img.decodeImage(bytes is Uint8List ? bytes : Uint8List.fromList(bytes));
     if (decoded == null) return null;
 
     final imgW = decoded.width;
