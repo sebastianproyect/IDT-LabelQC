@@ -1,11 +1,45 @@
 import 'package:flutter_test/flutter_test.dart';
 import 'package:idtlabelqc/domain/entities/entities.dart';
 import 'package:idtlabelqc/services/iso/iso_analyzers.dart';
+import 'dart:typed_data';
 import 'dart:ui';
+
+// Helper: build a minimal NV21 frame with a synthetic barcode scanline.
+// NV21 = first W*H bytes = Y plane (luminance 0-255).
+// We fill the ROI region with alternating dark/light bars.
+Uint8List _makeSyntheticNV21({
+  required int width,
+  required int height,
+  required Rect barcodeRect,
+  required double symbolContrast, // 0.0–1.0 (e.g. 0.6 = 60% = Grade A SC)
+}) {
+  final total = (width * height * 3) ~/ 2;
+  final bytes = Uint8List(total);
+
+  // Fill Y-plane with mid-grey background
+  for (int i = 0; i < width * height; i++) bytes[i] = 128;
+
+  final light = (255 * (0.5 + symbolContrast / 2)).round().clamp(0, 255);
+  final dark = (255 * (0.5 - symbolContrast / 2)).round().clamp(0, 255);
+
+  final x0 = barcodeRect.left.toInt();
+  final x1 = barcodeRect.right.toInt();
+  final y0 = barcodeRect.top.toInt();
+  final y1 = barcodeRect.bottom.toInt();
+  final barW = ((x1 - x0) / 20).round().clamp(1, 20); // 20 bars
+
+  for (int y = y0; y < y1 && y < height; y++) {
+    for (int x = x0; x < x1 && x < width; x++) {
+      final barIdx = (x - x0) ~/ barW;
+      bytes[y * width + x] = (barIdx % 2 == 0) ? light : dark;
+    }
+  }
+  return bytes;
+}
 
 void main() {
   // ─── ISO 15416 (1D) ────────────────────────────────────────────────────────
-  group('ISO15416Analyzer — Geometric 1D', () {
+  group('ISO15416Analyzer — 1D', () {
     final analyzer = ISO15416Analyzer();
 
     test('Decoded EAN-13 → Decodability = A, isEstimated = false', () {
@@ -34,22 +68,6 @@ void main() {
       expect(params.decodability.rawMeasurement, 0.0);
     });
 
-    test('Overall grade ≥ C when decoded (minimum guarantee)', () {
-      final input = BarcodeAnalysisInput(
-        rawValue: '5901234123457',
-        symbology: BarcodeType.ean13,
-        boundingBox: const Rect.fromLTWH(100, 400, 400, 50),
-        captureSize: const Size(600, 1000),
-      );
-      final params = analyzer.analyze(input);
-
-      expect(
-        params.overallGrade.numeric,
-        greaterThanOrEqualTo(ISOGrade.C.numeric),
-        reason: 'A successfully decoded barcode must always be at least Grade C',
-      );
-    });
-
     test('Overall grade = F when not decoded', () {
       final input = BarcodeAnalysisInput(
         rawValue: null,
@@ -76,8 +94,7 @@ void main() {
       expect(params.quietZones?.isEstimated, false);
     });
 
-    test('Quiet zones Grade F — barcode fills entire frame', () {
-      // No left margin → 0 modules of quiet zone
+    test('Quiet zones Grade F — barcode fills entire frame (no margins)', () {
       final input = BarcodeAnalysisInput(
         rawValue: '5901234123457',
         symbology: BarcodeType.ean13,
@@ -100,7 +117,7 @@ void main() {
       expect(params.quietZones?.isEstimated, true);
     });
 
-    test('Symbol contrast, modulation, defects are all estimated', () {
+    test('Without image data → photometric params estimated, grade C (conservative)', () {
       final input = BarcodeAnalysisInput(
         rawValue: '5901234123457',
         symbology: BarcodeType.code128,
@@ -111,6 +128,9 @@ void main() {
       expect(params.symbolContrast.isEstimated, true);
       expect(params.modulation.isEstimated, true);
       expect(params.defects.isEstimated, true);
+      // Conservative fallback must give C, not B (B was the bug)
+      expect(params.symbolContrast.grade.numeric,
+          lessThanOrEqualTo(ISOGrade.C.numeric));
     });
 
     test('Overall grade equals worst of all parameters', () {
@@ -126,10 +146,89 @@ void main() {
 
       expect(params.overallGrade, worstExpected);
     });
+
+    // ── Y-plane analysis: synthetic NV21 tests ─────────────────────────────
+
+    test('High-contrast NV21 (SC=70%) → SC Grade A, isEstimated=false', () {
+      const W = 640, H = 480;
+      const bb = Rect.fromLTWH(80, 180, 480, 120);
+      final bytes = _makeSyntheticNV21(
+        width: W, height: H, barcodeRect: bb, symbolContrast: 0.70,
+      );
+      final input = BarcodeAnalysisInput(
+        rawValue: '12345678',
+        symbology: BarcodeType.code128,
+        boundingBox: bb,
+        captureSize: const Size(W.toDouble(), H.toDouble()),
+        imageBytes: bytes,
+      );
+      final params = analyzer.analyze(input);
+
+      // Should use Y-plane analysis (not fallback)
+      expect(params.symbolContrast.isEstimated, false,
+          reason: 'Y-plane bytes available → real measurement');
+      expect(params.symbolContrast.grade.numeric,
+          greaterThanOrEqualTo(ISOGrade.A.numeric),
+          reason: '70% SC must grade as A');
+    });
+
+    test('Low-contrast NV21 (SC=15%) → SC Grade F or D', () {
+      const W = 640, H = 480;
+      const bb = Rect.fromLTWH(80, 180, 480, 120);
+      final bytes = _makeSyntheticNV21(
+        width: W, height: H, barcodeRect: bb, symbolContrast: 0.15,
+      );
+      final input = BarcodeAnalysisInput(
+        rawValue: '12345678', // ML Kit can still read at 15%, but ISO says F
+        symbology: BarcodeType.code128,
+        boundingBox: bb,
+        captureSize: const Size(W.toDouble(), H.toDouble()),
+        imageBytes: bytes,
+      );
+      final params = analyzer.analyze(input);
+
+      // KEY REGRESSION TEST: decoded≠good. Real pixel data must show the fault.
+      expect(params.symbolContrast.grade.numeric,
+          lessThanOrEqualTo(ISOGrade.D.numeric),
+          reason: '15% SC is below ISO Grade D threshold (20%) → D or F');
+      expect(params.symbolContrast.isEstimated, false);
+    });
+
+    test('Medium-contrast NV21 (SC=45%) → SC Grade C', () {
+      const W = 640, H = 480;
+      const bb = Rect.fromLTWH(80, 180, 480, 120);
+      final bytes = _makeSyntheticNV21(
+        width: W, height: H, barcodeRect: bb, symbolContrast: 0.45,
+      );
+      final input = BarcodeAnalysisInput(
+        rawValue: 'ABCDE',
+        symbology: BarcodeType.code128,
+        boundingBox: bb,
+        captureSize: const Size(W.toDouble(), H.toDouble()),
+        imageBytes: bytes,
+      );
+      final params = analyzer.analyze(input);
+
+      // 45% SC should be Grade C (40-55% range)
+      expect(params.symbolContrast.grade, ISOGrade.C);
+      expect(params.symbolContrast.isEstimated, false);
+    });
+
+    test('Empty imageBytes → falls back to conservative estimate', () {
+      final input = BarcodeAnalysisInput(
+        rawValue: '12345',
+        symbology: BarcodeType.code128,
+        imageBytes: Uint8List(0), // empty, not null
+        captureSize: const Size(640, 480),
+      );
+      final params = analyzer.analyze(input);
+
+      expect(params.symbolContrast.isEstimated, true);
+    });
   });
 
   // ─── ISO 15415 (2D) ────────────────────────────────────────────────────────
-  group('ISO15415Analyzer — Geometric 2D', () {
+  group('ISO15415Analyzer — 2D', () {
     final analyzer = ISO15415Analyzer();
 
     test('Decoded QR → Decodability = A, isEstimated = false', () {
@@ -161,10 +260,10 @@ void main() {
         rawValue: 'TEST',
         symbology: BarcodeType.qrCode,
         corners: const [
-          Offset(100, 100), // topLeft
-          Offset(300, 100), // topRight
-          Offset(300, 300), // bottomRight
-          Offset(100, 300), // bottomLeft
+          Offset(100, 100),
+          Offset(300, 100),
+          Offset(300, 300),
+          Offset(100, 300),
         ],
         captureSize: const Size(1080, 1920),
       );
@@ -192,7 +291,7 @@ void main() {
       expect(params.axialNonuniformity?.isEstimated, false);
     });
 
-    test('Trapezoidal corners (top shorter than bottom) → GNU > 0', () {
+    test('Trapezoidal corners (top half as wide as bottom) → GNU = Grade F', () {
       final input = BarcodeAnalysisInput(
         rawValue: 'TEST',
         symbology: BarcodeType.qrCode,
@@ -241,7 +340,7 @@ void main() {
       expect(params.overallGrade, expected);
     });
 
-    test('Photometric params (SC, MOD, DEF) always isEstimated = true', () {
+    test('Without image data → photometric params estimated (not better than C)', () {
       final input = BarcodeAnalysisInput(
         rawValue: 'TEST',
         symbology: BarcodeType.qrCode,
@@ -253,6 +352,29 @@ void main() {
       expect(params.modulation.isEstimated, true);
       expect(params.defects.isEstimated, true);
       expect(params.printGrowth!.isEstimated, true);
+      // Must not give B or A — Grade C is the conservative ceiling
+      expect(params.symbolContrast.grade.numeric,
+          lessThanOrEqualTo(ISOGrade.C.numeric));
+    });
+
+    test('High-contrast NV21 for 2D → SC Grade A, isEstimated=false', () {
+      const W = 640, H = 480;
+      const bb = Rect.fromLTWH(160, 100, 320, 280);
+      final bytes = _makeSyntheticNV21(
+        width: W, height: H, barcodeRect: bb, symbolContrast: 0.75,
+      );
+      final input = BarcodeAnalysisInput(
+        rawValue: 'QR-DATA',
+        symbology: BarcodeType.qrCode,
+        boundingBox: bb,
+        captureSize: const Size(W.toDouble(), H.toDouble()),
+        imageBytes: bytes,
+      );
+      final params = analyzer.analyze(input);
+
+      expect(params.symbolContrast.isEstimated, false);
+      expect(params.symbolContrast.grade.numeric,
+          greaterThanOrEqualTo(ISOGrade.A.numeric));
     });
   });
 
@@ -300,8 +422,8 @@ void main() {
   });
 
   // ─── ISOGrade ───────────────────────────────────────────────────────────────
-  group('ISOGrade.worst', () {
-    test('Returns the worst grade in a list', () {
+  group('ISOGrade', () {
+    test('worst() returns the lowest grade in a list', () {
       expect(
         ISOGrade.worst([ISOGrade.A, ISOGrade.B, ISOGrade.C]),
         ISOGrade.C,
