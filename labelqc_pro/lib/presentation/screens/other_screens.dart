@@ -1,6 +1,7 @@
 import 'package:flutter/material.dart';
 import 'package:go_router/go_router.dart';
 import 'package:fl_chart/fl_chart.dart';
+import 'package:uuid/uuid.dart';
 import '../../core/theme/app_theme.dart';
 import '../widgets/common/widgets.dart';
 import '../../domain/entities/entities.dart';
@@ -454,44 +455,118 @@ class SettingsScreen extends StatefulWidget {
 }
 
 class _SettingsScreenState extends State<SettingsScreen> {
+  final _db = getIt<AppDatabase>();
+
+  // Loaded from DB
+  String _minGrade = 'C';
+  String _printSystem = 'ttr';
   bool _vibration = true, _sounds = true, _saveImages = true;
+  bool _loading = true;
+
+  @override
+  void initState() {
+    super.initState();
+    _loadSettings();
+  }
+
+  Future<void> _loadSettings() async {
+    final s = await _db.getAllSettings();
+    if (!mounted) return;
+    setState(() {
+      _minGrade = s['min_acceptable_grade'] ?? 'C';
+      _printSystem = s['print_system'] ?? 'ttr';
+      _vibration = s['vibration'] != 'false';
+      _sounds = s['sounds'] != 'false';
+      _saveImages = s['save_images'] != 'false';
+      _loading = false;
+    });
+  }
+
+  Future<void> _save(String key, String value) async {
+    await _db.setSetting(key, value);
+  }
 
   @override
   Widget build(BuildContext context) {
+    if (_loading) {
+      return const Scaffold(
+        backgroundColor: AppColors.bg,
+        body: Center(child: CircularProgressIndicator(color: AppColors.accent)),
+      );
+    }
+
     return Scaffold(
       backgroundColor: AppColors.bg,
       appBar: AppBar(title: const Text('Configuración')),
       body: ListView(
         padding: const EdgeInsets.all(16),
         children: [
-          _Sec('EMPRESA', [
-            _Tile(Icons.business_rounded, 'Nombre empresa', value: 'Mi Empresa', onTap: () {}),
-            _Tile(Icons.image_rounded, 'Logo empresa', value: 'Cargar imagen', onTap: () {}),
-          ]),
+          // ── VERIFICACIÓN ──
           _Sec('VERIFICACIÓN', [
-            _Tile(Icons.rule_rounded, 'Norma por defecto', value: 'Auto (ISO 15415/15416)', onTap: () {}),
-            _Tile(Icons.grade_rounded, 'Calidad mínima aceptable', value: 'Grado C', onTap: () {}),
+            _DropdownTile<String>(
+              icon: Icons.grade_rounded,
+              label: 'Calidad mínima aceptable',
+              value: _minGrade,
+              items: const ['A', 'B', 'C', 'D', 'F'],
+              itemLabel: (v) => 'Grado $v',
+              onChanged: (v) {
+                setState(() => _minGrade = v!);
+                _save('min_acceptable_grade', v!);
+              },
+            ),
             _Toggle(Icons.photo_camera_rounded, 'Guardar imagen en verificación',
-                _saveImages, (v) => setState(() => _saveImages = v)),
+                _saveImages, (v) {
+              setState(() => _saveImages = v);
+              _save('save_images', v.toString());
+            }),
           ]),
+
+          // ── SISTEMA DE IMPRESIÓN ──
+          _Sec('SISTEMA DE IMPRESIÓN', [
+            _DropdownTile<String>(
+              icon: Icons.print_rounded,
+              label: 'Sistema de impresión',
+              value: _printSystem,
+              items: PrintSystem.values.map((p) => p.name).toList(),
+              itemLabel: (v) => PrintSystem.fromName(v).displayName,
+              onChanged: (v) {
+                setState(() => _printSystem = v!);
+                _save('print_system', v!);
+              },
+            ),
+          ]),
+
+          // ── OPERARIOS ──
+          _Sec('OPERARIOS', [
+            _Tile(Icons.people_rounded, 'Gestión de operarios',
+                value: 'Añadir / eliminar',
+                onTap: () => context.push('/operators')),
+          ]),
+
+          // ── INTERFAZ ──
           _Sec('INTERFAZ', [
             _Toggle(Icons.vibration_rounded, 'Vibración al escanear',
-                _vibration, (v) => setState(() => _vibration = v)),
+                _vibration, (v) {
+              setState(() => _vibration = v);
+              _save('vibration', v.toString());
+            }),
             _Toggle(Icons.volume_up_rounded, 'Sonidos',
-                _sounds, (v) => setState(() => _sounds = v)),
+                _sounds, (v) {
+              setState(() => _sounds = v);
+              _save('sounds', v.toString());
+            }),
           ]),
-          _Sec('USUARIOS Y SEGURIDAD', [
-            _Tile(Icons.people_rounded, 'Gestión de usuarios', onTap: () {}),
-            _Tile(Icons.lock_rounded, 'Cambiar contraseña', onTap: () {}),
-            _Tile(Icons.history_rounded, 'Log de auditoría', onTap: () {}),
-          ]),
+
+          // ── ACERCA DE ──
           _Sec('ACERCA DE', [
-            _Tile(Icons.info_rounded, 'Versión', value: '1.0.0', onTap: null),
-            _Tile(Icons.description_rounded, 'Normativas', value: 'ISO 15416 · ISO 15415', onTap: null),
+            _Tile(Icons.info_rounded, 'Versión', value: '2.0.0', onTap: null),
+            _Tile(Icons.description_rounded, 'Normativas',
+                value: 'ISO 15416 · ISO 15415', onTap: null),
           ]),
+
           const SizedBox(height: 40),
           const Center(child: Text(
-            'IDT LabelQC v1.0.0\n© 2025 · Verificación ISO de calidad de impresión',
+            'IDT LabelQC v2.0.0\n© 2025 · Verificación ISO de calidad de impresión',
             textAlign: TextAlign.center,
             style: TextStyle(fontSize: 11, color: AppColors.textMuted, height: 1.6),
           )),
@@ -501,6 +576,180 @@ class _SettingsScreenState extends State<SettingsScreen> {
     );
   }
 }
+
+// ════════════════════════════════════════════
+// OPERATOR MANAGEMENT SCREEN
+// ════════════════════════════════════════════
+
+class OperatorManagementScreen extends StatefulWidget {
+  const OperatorManagementScreen({super.key});
+  @override
+  State<OperatorManagementScreen> createState() => _OperatorManagementScreenState();
+}
+
+class _OperatorManagementScreenState extends State<OperatorManagementScreen> {
+  final _db = getIt<AppDatabase>();
+  List<Operator> _operators = [];
+
+  @override
+  void initState() {
+    super.initState();
+    _load();
+  }
+
+  Future<void> _load() async {
+    final ops = await _db.getOperators();
+    if (mounted) setState(() => _operators = ops);
+  }
+
+  Future<void> _addOperator() async {
+    final nameCtrl = TextEditingController();
+    final ok = await showDialog<bool>(
+      context: context,
+      builder: (_) => AlertDialog(
+        backgroundColor: AppColors.surface,
+        title: const Text('Nuevo operario', style: TextStyle(color: AppColors.textPrimary)),
+        content: TextField(
+          controller: nameCtrl,
+          autofocus: true,
+          style: const TextStyle(color: AppColors.textPrimary),
+          decoration: const InputDecoration(
+            hintText: 'Nombre del operario',
+            hintStyle: TextStyle(color: AppColors.textMuted),
+          ),
+        ),
+        actions: [
+          TextButton(
+            onPressed: () => Navigator.pop(context, false),
+            child: const Text('Cancelar', style: TextStyle(color: AppColors.textSecondary)),
+          ),
+          ElevatedButton(
+            onPressed: () => Navigator.pop(context, true),
+            child: const Text('Añadir'),
+          ),
+        ],
+      ),
+    );
+    if (ok == true && nameCtrl.text.trim().isNotEmpty) {
+      await _db.insertOperator(Operator(
+        id: const Uuid().v4(),
+        name: nameCtrl.text.trim(),
+        createdAt: DateTime.now(),
+      ));
+      _load();
+    }
+  }
+
+  Future<void> _deleteOperator(Operator op) async {
+    final ok = await showDialog<bool>(
+      context: context,
+      builder: (_) => AlertDialog(
+        backgroundColor: AppColors.surface,
+        title: const Text('Eliminar operario', style: TextStyle(color: AppColors.textPrimary)),
+        content: Text('¿Eliminar a ${op.name}?',
+            style: const TextStyle(color: AppColors.textSecondary)),
+        actions: [
+          TextButton(
+            onPressed: () => Navigator.pop(context, false),
+            child: const Text('Cancelar', style: TextStyle(color: AppColors.textSecondary)),
+          ),
+          ElevatedButton(
+            style: ElevatedButton.styleFrom(backgroundColor: AppColors.nok),
+            onPressed: () => Navigator.pop(context, true),
+            child: const Text('Eliminar'),
+          ),
+        ],
+      ),
+    );
+    if (ok == true) {
+      await _db.deleteOperator(op.id);
+      _load();
+    }
+  }
+
+  @override
+  Widget build(BuildContext context) {
+    return Scaffold(
+      backgroundColor: AppColors.bg,
+      appBar: AppBar(
+        title: const Text('Gestión de operarios'),
+        actions: [
+          IconButton(
+            icon: const Icon(Icons.person_add_rounded),
+            onPressed: _addOperator,
+            tooltip: 'Añadir operario',
+          ),
+        ],
+      ),
+      body: _operators.isEmpty
+          ? Center(
+              child: Column(mainAxisSize: MainAxisSize.min, children: [
+                const Text('👷', style: TextStyle(fontSize: 48)),
+                const SizedBox(height: 16),
+                const Text('Sin operarios', style: TextStyle(
+                  fontSize: 17, fontWeight: FontWeight.w700, color: AppColors.textPrimary,
+                )),
+                const SizedBox(height: 8),
+                const Text('Añade operarios para asignarlos a las OF.',
+                    style: TextStyle(fontSize: 13, color: AppColors.textSecondary)),
+                const SizedBox(height: 20),
+                ElevatedButton.icon(
+                  onPressed: _addOperator,
+                  icon: const Icon(Icons.add),
+                  label: const Text('Añadir operario'),
+                ),
+              ]),
+            )
+          : ListView.separated(
+              padding: const EdgeInsets.all(16),
+              itemCount: _operators.length,
+              separatorBuilder: (_, __) => const SizedBox(height: 8),
+              itemBuilder: (_, i) {
+                final op = _operators[i];
+                return Container(
+                  padding: const EdgeInsets.symmetric(horizontal: 16, vertical: 14),
+                  decoration: BoxDecoration(
+                    color: AppColors.surface,
+                    borderRadius: BorderRadius.circular(12),
+                    border: Border.all(color: AppColors.border),
+                  ),
+                  child: Row(children: [
+                    Container(
+                      width: 36, height: 36,
+                      decoration: BoxDecoration(
+                        color: AppColors.accentDim,
+                        borderRadius: BorderRadius.circular(8),
+                      ),
+                      child: const Icon(Icons.person_rounded,
+                          color: AppColors.accent, size: 20),
+                    ),
+                    const SizedBox(width: 14),
+                    Expanded(child: Text(op.name, style: const TextStyle(
+                      fontSize: 15, fontWeight: FontWeight.w600,
+                      color: AppColors.textPrimary,
+                    ))),
+                    IconButton(
+                      icon: const Icon(Icons.delete_outline_rounded,
+                          color: AppColors.nok, size: 20),
+                      onPressed: () => _deleteOperator(op),
+                    ),
+                  ]),
+                );
+              },
+            ),
+      floatingActionButton: FloatingActionButton(
+        onPressed: _addOperator,
+        backgroundColor: AppColors.accent,
+        foregroundColor: Colors.black,
+        child: const Icon(Icons.person_add_rounded),
+      ),
+    );
+  }
+}
+
+// ════════════════════════════════════════════
+// SETTINGS HELPER WIDGETS
+// ════════════════════════════════════════════
 
 class _Sec extends StatelessWidget {
   final String title;
@@ -551,10 +800,13 @@ class _Tile extends StatelessWidget {
         child: Row(children: [
           Icon(icon, color: AppColors.textSecondary, size: 20),
           const SizedBox(width: 14),
-          Expanded(child: Text(label, style: const TextStyle(fontSize: 14, color: AppColors.textPrimary))),
-          if (value != null) Text(value!, style: const TextStyle(fontSize: 12, color: AppColors.textSecondary)),
+          Expanded(child: Text(label,
+              style: const TextStyle(fontSize: 14, color: AppColors.textPrimary))),
+          if (value != null) Text(value!,
+              style: const TextStyle(fontSize: 12, color: AppColors.textSecondary)),
           if (onTap != null) const SizedBox(width: 6),
-          if (onTap != null) const Icon(Icons.chevron_right_rounded, color: AppColors.textMuted, size: 16),
+          if (onTap != null) const Icon(Icons.chevron_right_rounded,
+              color: AppColors.textMuted, size: 16),
         ]),
       ),
     );
@@ -574,8 +826,47 @@ class _Toggle extends StatelessWidget {
       child: Row(children: [
         Icon(icon, color: AppColors.textSecondary, size: 20),
         const SizedBox(width: 14),
-        Expanded(child: Text(label, style: const TextStyle(fontSize: 14, color: AppColors.textPrimary))),
+        Expanded(child: Text(label,
+            style: const TextStyle(fontSize: 14, color: AppColors.textPrimary))),
         Switch(value: value, onChanged: onChanged),
+      ]),
+    );
+  }
+}
+
+class _DropdownTile<T> extends StatelessWidget {
+  final IconData icon;
+  final String label;
+  final T value;
+  final List<T> items;
+  final String Function(T) itemLabel;
+  final ValueChanged<T?> onChanged;
+
+  const _DropdownTile({
+    required this.icon, required this.label, required this.value,
+    required this.items, required this.itemLabel, required this.onChanged,
+  });
+
+  @override
+  Widget build(BuildContext context) {
+    return Padding(
+      padding: const EdgeInsets.symmetric(horizontal: 16, vertical: 8),
+      child: Row(children: [
+        Icon(icon, color: AppColors.textSecondary, size: 20),
+        const SizedBox(width: 14),
+        Expanded(child: Text(label,
+            style: const TextStyle(fontSize: 14, color: AppColors.textPrimary))),
+        DropdownButton<T>(
+          value: value,
+          dropdownColor: AppColors.surface2,
+          style: const TextStyle(fontSize: 13, color: AppColors.textPrimary),
+          underline: const SizedBox.shrink(),
+          items: items.map((v) => DropdownMenuItem(
+            value: v,
+            child: Text(itemLabel(v)),
+          )).toList(),
+          onChanged: onChanged,
+        ),
       ]),
     );
   }

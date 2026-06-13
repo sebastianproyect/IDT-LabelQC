@@ -292,6 +292,7 @@ class RecommendationEngine {
     required BarcodeVerification verification,
     PatternComparison? comparison,
     SPCResult? spcResult,
+    PrintSystem? printSystem,
   }) {
     final recs = <Recommendation>[];
     final p = verification.parameters;
@@ -366,6 +367,11 @@ class RecommendationEngine {
       recs.addAll(spcResult.recommendations);
     }
 
+    // Print-system-specific recommendations (only when quality is not A)
+    if (printSystem != null && verification.overallGrade.numeric < 4) {
+      recs.addAll(_printSystemRecs(printSystem, p));
+    }
+
     // Deduplicate and sort by priority
     final unique = <String, Recommendation>{};
     for (final r in recs) {
@@ -427,6 +433,71 @@ class RecommendationEngine {
           action: 'Disminuir velocidad 10-20% para mejorar control de tinta',
         ),
       ];
+
+  List<Recommendation> _printSystemRecs(PrintSystem ps, ISOParameters p) {
+    final recs = <Recommendation>[];
+    final scLow = p.symbolContrast.grade.numeric < 3;
+    final defHigh = p.defects.rawMeasurement > 0.20;
+    final isTTR = ps == PrintSystem.ttr || ps == PrintSystem.sato ||
+        ps == PrintSystem.zebra || ps == PrintSystem.cls || ps == PrintSystem.zhilian;
+    final isInkjet = ps == PrintSystem.inkjet;
+    final isDigital = ps == PrintSystem.digital || ps == PrintSystem.konica || ps == PrintSystem.oki;
+    final isAnalog = ps == PrintSystem.analogico || ps == PrintSystem.flexografia || ps == PrintSystem.offset;
+
+    if (isTTR) {
+      if (scLow) recs.add(const Recommendation(
+        priority: RecommendationPriority.high,
+        category: RecommendationCategory.ribbon,
+        title: 'TTR: Verificar ribbon y temperatura',
+        action: 'Comprobar densidad óptica del ribbon y ajustar temperatura del cabezal',
+        details: 'En sistemas TTR el SC bajo indica ribbon agotado, temperatura insuficiente o velocidad excesiva.',
+      ));
+      if (defHigh) recs.add(const Recommendation(
+        priority: RecommendationPriority.high,
+        category: RecommendationCategory.head,
+        title: 'TTR: Limpiar cabezal de impresión',
+        action: 'Limpiar con paño IPA. Verificar desgaste de los elementos calefactores.',
+        details: 'Los defectos en TTR suelen deberse a suciedad o daño en el cabezal térmico.',
+      ));
+    } else if (isInkjet) {
+      if (scLow) recs.add(const Recommendation(
+        priority: RecommendationPriority.high,
+        category: RecommendationCategory.energy,
+        title: 'Inkjet: Revisión de inyectores y tinta',
+        action: 'Ejecutar ciclo de limpieza. Verificar viscosidad y nivel de tinta.',
+        details: 'SC bajo en inkjet indica inyectores obstruidos, tinta diluida o distancia incorrecta al sustrato.',
+      ));
+      if (defHigh) recs.add(const Recommendation(
+        priority: RecommendationPriority.high,
+        category: RecommendationCategory.head,
+        title: 'Inkjet: Ejecutar nozzle check',
+        action: 'Realizar purga y limpieza profunda de cabezal',
+      ));
+    } else if (isDigital) {
+      if (scLow) recs.add(const Recommendation(
+        priority: RecommendationPriority.medium,
+        category: RecommendationCategory.energy,
+        title: 'Digital: Calibrar densidad de impresión',
+        action: 'Verificar nivel de tóner/drum y ejecutar calibración de color',
+      ));
+    } else if (isAnalog) {
+      if (scLow) recs.add(const Recommendation(
+        priority: RecommendationPriority.high,
+        category: RecommendationCategory.energy,
+        title: 'Analógico: Ajustar presión y densidad de tinta',
+        action: 'Aumentar densidad de tinta. Verificar estado de planchas/clichés.',
+        details: 'SC bajo en impresión analógica indica tinta insuficiente, presión incorrecta o desgaste de clichés.',
+      ));
+      final pg = p.printGrowth;
+      if (pg != null && pg.rawMeasurement > 0.15) recs.add(const Recommendation(
+        priority: RecommendationPriority.medium,
+        category: RecommendationCategory.energy,
+        title: 'Analógico: Print growth elevado — reducir presión',
+        action: 'Reducir presión de impresión 5-10% y evaluar resultado',
+      ));
+    }
+    return recs;
+  }
 
   List<Recommendation> _comparisonRecs(PatternComparison comp) {
     final recs = <Recommendation>[];

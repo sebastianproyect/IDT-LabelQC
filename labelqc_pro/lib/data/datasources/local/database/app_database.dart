@@ -22,12 +22,39 @@ class AppDatabase {
     final path = p.join(dbPath, 'idtlabelqc.db');
     return openDatabase(
       path,
-      version: 1,
+      version: 2,
       onCreate: _onCreate,
+      onUpgrade: _onUpgrade,
     );
   }
 
   Future<void> _onCreate(Database db, int version) async {
+    await _createTables(db);
+    await _seedDefaults(db);
+  }
+
+  Future<void> _onUpgrade(Database db, int oldVersion, int newVersion) async {
+    if (oldVersion < 2) {
+      // Add operators table
+      await db.execute('''
+        CREATE TABLE IF NOT EXISTS operators (
+          id TEXT PRIMARY KEY,
+          name TEXT NOT NULL,
+          created_at INTEGER NOT NULL
+        )
+      ''');
+      // Add settings table
+      await db.execute('''
+        CREATE TABLE IF NOT EXISTS app_settings (
+          key TEXT PRIMARY KEY,
+          value TEXT NOT NULL
+        )
+      ''');
+      await _seedSettings(db);
+    }
+  }
+
+  Future<void> _createTables(Database db) async {
     await db.execute('''
       CREATE TABLE work_orders (
         id TEXT PRIMARY KEY,
@@ -104,8 +131,25 @@ class AppDatabase {
       )
     ''');
 
-    // Seed admin user
+    await db.execute('''
+      CREATE TABLE operators (
+        id TEXT PRIMARY KEY,
+        name TEXT NOT NULL,
+        created_at INTEGER NOT NULL
+      )
+    ''');
+
+    await db.execute('''
+      CREATE TABLE app_settings (
+        key TEXT PRIMARY KEY,
+        value TEXT NOT NULL
+      )
+    ''');
+  }
+
+  Future<void> _seedDefaults(Database db) async {
     final now = DateTime.now().millisecondsSinceEpoch;
+    // Admin user
     await db.insert('operator_users', {
       'id': 'admin-001',
       'name': 'Administrador',
@@ -115,9 +159,63 @@ class AppDatabase {
       'is_active': 1,
       'created_at': now,
     });
+    await _seedSettings(db);
   }
 
-  // ── Verifications ──
+  Future<void> _seedSettings(Database db) async {
+    await db.insert('app_settings', {'key': 'min_acceptable_grade', 'value': 'C'},
+        conflictAlgorithm: ConflictAlgorithm.ignore);
+    await db.insert('app_settings', {'key': 'print_system', 'value': 'ttr'},
+        conflictAlgorithm: ConflictAlgorithm.ignore);
+    await db.insert('app_settings', {'key': 'vibration', 'value': 'true'},
+        conflictAlgorithm: ConflictAlgorithm.ignore);
+    await db.insert('app_settings', {'key': 'sounds', 'value': 'true'},
+        conflictAlgorithm: ConflictAlgorithm.ignore);
+    await db.insert('app_settings', {'key': 'save_images', 'value': 'true'},
+        conflictAlgorithm: ConflictAlgorithm.ignore);
+  }
+
+  // ── Settings ──────────────────────────────────────────────────────────────
+
+  Future<String?> getSetting(String key) async {
+    final db = await database;
+    final rows = await db.query('app_settings', where: 'key = ?', whereArgs: [key]);
+    return rows.isNotEmpty ? rows.first['value'] as String : null;
+  }
+
+  Future<void> setSetting(String key, String value) async {
+    final db = await database;
+    await db.insert('app_settings', {'key': key, 'value': value},
+        conflictAlgorithm: ConflictAlgorithm.replace);
+  }
+
+  Future<Map<String, String>> getAllSettings() async {
+    final db = await database;
+    final rows = await db.query('app_settings');
+    return {for (final r in rows) r['key'] as String: r['value'] as String};
+  }
+
+  // ── Operators (simple OF operators) ──────────────────────────────────────
+
+  Future<List<Operator>> getOperators() async {
+    final db = await database;
+    final rows = await db.query('operators', orderBy: 'name ASC');
+    return rows.map(Operator.fromMap).toList();
+  }
+
+  Future<void> insertOperator(Operator op) async {
+    final db = await database;
+    await db.insert('operators', op.toMap(),
+        conflictAlgorithm: ConflictAlgorithm.replace);
+  }
+
+  Future<void> deleteOperator(String id) async {
+    final db = await database;
+    await db.delete('operators', where: 'id = ?', whereArgs: [id]);
+  }
+
+  // ── Verifications ──────────────────────────────────────────────────────────
+
   Future<String> insertVerification(BarcodeVerification v) async {
     final db = await database;
     await db.insert('barcode_verifications', {
@@ -149,7 +247,16 @@ class AppDatabase {
         orderBy: 'timestamp DESC', limit: limit);
   }
 
-  // ── Work Orders ──
+  Future<List<Map<String, dynamic>>> getVerificationsForWorkOrder(String workOrderId) async {
+    final db = await database;
+    return db.query('barcode_verifications',
+        where: 'work_order_id = ?',
+        whereArgs: [workOrderId],
+        orderBy: 'timestamp ASC');
+  }
+
+  // ── Work Orders ────────────────────────────────────────────────────────────
+
   Future<void> insertWorkOrder(WorkOrder wo) async {
     final db = await database;
     await db.insert('work_orders', {
@@ -199,7 +306,8 @@ class AppDatabase {
     );
   }
 
-  // ── Patterns ──
+  // ── Patterns ───────────────────────────────────────────────────────────────
+
   Future<void> insertPattern(MasterPattern pattern) async {
     final db = await database;
     await db.insert('master_patterns', {
@@ -226,7 +334,8 @@ class AppDatabase {
         where: 'is_active = 1', orderBy: 'created_at DESC');
   }
 
-  // ── Auth ──
+  // ── Auth ───────────────────────────────────────────────────────────────────
+
   Future<Map<String, dynamic>?> authenticate(String username, String password) async {
     final db = await database;
     final hash = base64Encode(utf8.encode(password));
@@ -244,7 +353,8 @@ class AppDatabase {
     return null;
   }
 
-  // ── Dashboard ──
+  // ── Dashboard ──────────────────────────────────────────────────────────────
+
   Future<Map<String, dynamic>> getDashboardStats() async {
     final db = await database;
     final rows = await db.query('barcode_verifications');

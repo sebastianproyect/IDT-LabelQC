@@ -166,9 +166,30 @@ class _ProductionScanScreenState extends State<ProductionScanScreen>
             overlayBuilder: (context, constraints) => const SizedBox.shrink(),
           ),
 
-          // Scan overlay
+          // Scan zone — limited central band (30% height) for better detection
           if (!_showResult)
-            const Positioned.fill(child: ScanOverlay(isActive: true)),
+            Positioned.fill(
+              child: LayoutBuilder(builder: (_, constraints) {
+                final h = constraints.maxHeight;
+                final zoneH = h * 0.30;
+                final zoneTop = (h - zoneH) / 2;
+                return Stack(children: [
+                  Positioned(top: 0, left: 0, right: 0, height: zoneTop,
+                    child: Container(color: Colors.black.withOpacity(0.55))),
+                  Positioned(bottom: 0, left: 0, right: 0, height: zoneTop,
+                    child: Container(color: Colors.black.withOpacity(0.55))),
+                  Positioned(top: zoneTop, left: 16, right: 16, height: zoneH,
+                    child: const DecoratedBox(
+                      decoration: BoxDecoration(
+                        border: Border.fromBorderSide(
+                          BorderSide(color: Color(0xFFFFC107), width: 1.5)),
+                        borderRadius: BorderRadius.all(Radius.circular(8)),
+                      ),
+                    ),
+                  ),
+                ]);
+              }),
+            ),
 
           // Top bar
           SafeArea(

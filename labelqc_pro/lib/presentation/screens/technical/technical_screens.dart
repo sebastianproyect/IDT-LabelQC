@@ -130,7 +130,29 @@ class _TechnicalScanScreenState extends State<TechnicalScanScreen> {
       body: Stack(
         children: [
           MobileScanner(controller: _scanner, onDetect: _onDetect),
-          const Positioned.fill(child: ScanOverlay(isActive: true)),
+          // Limited scan zone band (30% height) for better detection accuracy
+          Positioned.fill(
+            child: LayoutBuilder(builder: (_, constraints) {
+              final h = constraints.maxHeight;
+              final zoneH = h * 0.30;
+              final zoneTop = (h - zoneH) / 2;
+              return Stack(children: [
+                Positioned(top: 0, left: 0, right: 0, height: zoneTop,
+                  child: Container(color: Colors.black.withOpacity(0.55))),
+                Positioned(bottom: 0, left: 0, right: 0, height: zoneTop,
+                  child: Container(color: Colors.black.withOpacity(0.55))),
+                Positioned(top: zoneTop, left: 16, right: 16, height: zoneH,
+                  child: DecoratedBox(
+                    decoration: BoxDecoration(
+                      border: Border.all(
+                          color: AppColors.accent.withOpacity(0.8), width: 1.5),
+                      borderRadius: BorderRadius.circular(8),
+                    ),
+                  ),
+                ),
+              ]);
+            }),
+          ),
           SafeArea(
             child: Padding(
               padding: const EdgeInsets.all(16),

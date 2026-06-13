@@ -13,6 +13,7 @@ import '../screens/master_pattern/pattern_create_screen.dart';
 import '../screens/master_pattern/pattern_detail_screen.dart';
 import '../screens/dashboard/dashboard_screen.dart';
 import '../screens/settings/settings_screen.dart';
+import '../screens/other_screens.dart' show OperatorManagementScreen;
 import '../../domain/entities/entities.dart';
 
 class AppRouter {
@@ -83,6 +84,10 @@ class AppRouter {
       GoRoute(
         path: '/settings',
         builder: (_, __) => const SettingsScreen(),
+      ),
+      GoRoute(
+        path: '/operators',
+        builder: (_, __) => const OperatorManagementScreen(),
       ),
     ],
   );

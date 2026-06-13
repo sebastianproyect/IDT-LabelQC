@@ -41,14 +41,16 @@ class ISO15416Analyzer {
     final H = input.captureSize.height.round();
     if (W <= 0 || H <= 0) return null;
 
-    // Path 1: NV21 / YUV420 raw bytes — Y-plane = first W*H bytes
-    if (bytes.length >= W * H) {
-      return _profileFromYPlane(bytes, W, H, input);
-    }
-
-    // Path 2: JPEG (magic bytes FF D8)
+    // IMPORTANT: Check JPEG *first* — a high-quality JPEG can be > W*H bytes
+    // and would be misidentified as NV21 if we checked length first.
+    // Path 1: JPEG (magic bytes FF D8 FF)
     if (bytes.length > 3 && bytes[0] == 0xFF && bytes[1] == 0xD8) {
       return _profileFromJpeg(bytes, input);
+    }
+
+    // Path 2: NV21 / YUV420 raw bytes — Y-plane = first W*H bytes
+    if (bytes.length >= W * H) {
+      return _profileFromYPlane(bytes, W, H, input);
     }
 
     return null;
@@ -85,7 +87,7 @@ class ISO15416Analyzer {
         if (v < lo) lo = v;
         if (v > hi) hi = v;
       }
-      if (hi - lo < 38) continue;
+      if (hi - lo < 20) continue;
       final thresh = (lo + hi) ~/ 2;
       int trans = 0;
       bool wasLight = bytes[rowBase] >= thresh;
@@ -112,7 +114,7 @@ class ISO15416Analyzer {
 
     final rMax = profile.reduce(max);
     final rMin = profile.reduce(min);
-    if (rMax - rMin < 0.12) return null;
+    if (rMax - rMin < 0.08) return null;
 
     return _ScanProfile(
       values: profile, rMax: rMax, rMin: rMin,
@@ -157,7 +159,7 @@ class ISO15416Analyzer {
         if (lv < lo) lo = lv;
         if (lv > hi) hi = lv;
       }
-      if (hi - lo < 38) continue;
+      if (hi - lo < 20) continue;
       final thresh = (lo + hi) ~/ 2;
       int t = 0;
       bool wasLight = _lum(decoded, x0, y) >= thresh;
@@ -182,7 +184,7 @@ class ISO15416Analyzer {
 
     final rMax = profile.reduce(max);
     final rMin = profile.reduce(min);
-    if (rMax - rMin < 0.12) return null;
+    if (rMax - rMin < 0.08) return null;
 
     return _ScanProfile(
       values: profile, rMax: rMax, rMin: rMin,
@@ -433,10 +435,11 @@ class ISO15415Analyzer {
     final H = input.captureSize.height.round();
     if (W <= 0 || H <= 0) return null;
 
-    if (bytes.length >= W * H) return _metricsFromYPlane(bytes, W, H, input);
+    // JPEG first (large JPEGs can be > W*H bytes → misidentified as NV21)
     if (bytes.length > 3 && bytes[0] == 0xFF && bytes[1] == 0xD8) {
       return _metricsFromJpeg(bytes, input);
     }
+    if (bytes.length >= W * H) return _metricsFromYPlane(bytes, W, H, input);
     return null;
   }
 

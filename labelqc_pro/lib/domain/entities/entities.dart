@@ -477,6 +477,53 @@ class OperatorUser extends Equatable {
 }
 
 // ══════════════════════════════
+// ══════════════════════════════
+// PRINT SYSTEM
+// ══════════════════════════════
+enum PrintSystem {
+  ttr('TTR / Transferencia térmica'),
+  sato('SATO'),
+  zebra('Zebra'),
+  inkjet('Inkjet'),
+  cls('CLS'),
+  zhilian('Zhilian'),
+  digital('Digital (tóner/laser)'),
+  konica('Konica'),
+  oki('OKI'),
+  analogico('Analógico (flexo/offset)'),
+  flexografia('Flexografía'),
+  offset('Offset'),
+  otros('Otros');
+
+  const PrintSystem(this.displayName);
+  final String displayName;
+
+  static PrintSystem fromName(String name) =>
+      PrintSystem.values.firstWhere((p) => p.name == name, orElse: () => ttr);
+}
+
+// ══════════════════════════════
+// SIMPLE OPERATOR (for OF)
+// ══════════════════════════════
+class Operator {
+  final String id;
+  final String name;
+  final DateTime createdAt;
+
+  const Operator({required this.id, required this.name, required this.createdAt});
+
+  Map<String, dynamic> toMap() => {
+    'id': id, 'name': name,
+    'created_at': createdAt.millisecondsSinceEpoch,
+  };
+
+  factory Operator.fromMap(Map<String, dynamic> m) => Operator(
+    id: m['id'] as String,
+    name: m['name'] as String,
+    createdAt: DateTime.fromMillisecondsSinceEpoch(m['created_at'] as int),
+  );
+}
+
 // SPC
 // ══════════════════════════════
 enum SPCTrend { stable, improving, decreasing, unstable, insufficient }
