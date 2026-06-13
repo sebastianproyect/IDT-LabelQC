@@ -7,6 +7,8 @@ import '../../widgets/common/widgets.dart';
 import '../../../domain/entities/entities.dart';
 import '../../../services/iso/iso_analyzers.dart';
 import '../../../services/spc/spc_and_recommendations.dart';
+import '../../../data/datasources/local/database/app_database.dart';
+import '../../../injection.dart';
 
 class ProductionScanScreen extends StatefulWidget {
   const ProductionScanScreen({super.key});
@@ -28,6 +30,7 @@ class _ProductionScanScreenState extends State<ProductionScanScreen>
   bool _isAnalyzing = false;
   bool _showResult = false;
   BarcodeVerification? _lastResult;
+  ISOGrade _minGrade = ISOGrade.C;
 
   late AnimationController _resultAnim;
   late Animation<double> _resultScale;
@@ -41,6 +44,17 @@ class _ProductionScanScreenState extends State<ProductionScanScreen>
     super.initState();
     _resultAnim = AnimationController(vsync: this, duration: const Duration(milliseconds: 350));
     _resultScale = CurvedAnimation(parent: _resultAnim, curve: Curves.elasticOut);
+    _loadSettings();
+  }
+
+  Future<void> _loadSettings() async {
+    final db = getIt<AppDatabase>();
+    final gradeStr = await db.getSetting('min_acceptable_grade') ?? 'C';
+    final grade = ISOGrade.values.firstWhere(
+      (g) => g.letter == gradeStr,
+      orElse: () => ISOGrade.C,
+    );
+    if (mounted) setState(() => _minGrade = grade);
   }
 
   @override
@@ -92,7 +106,8 @@ class _ProductionScanScreenState extends State<ProductionScanScreen>
         recommendations: recs,
       );
 
-      _hapticAndSound(verification.isAcceptable);
+      final isOk = verification.overallGrade.numeric >= _minGrade.numeric;
+      _hapticAndSound(isOk);
 
       setState(() {
         _lastResult = verification;
@@ -277,6 +292,7 @@ class _ProductionScanScreenState extends State<ProductionScanScreen>
                 scale: _resultScale,
                 child: _ResultOverlay(
                   verification: _lastResult!,
+                  isOk: _lastResult!.overallGrade.numeric >= _minGrade.numeric,
                   onContinue: _continueScanning,
                   onDetail: () {
                     _continueScanning();
@@ -308,18 +324,20 @@ class _ProductionScanScreenState extends State<ProductionScanScreen>
 
 class _ResultOverlay extends StatelessWidget {
   final BarcodeVerification verification;
+  final bool isOk;
   final VoidCallback onContinue;
   final VoidCallback onDetail;
 
   const _ResultOverlay({
     required this.verification,
+    required this.isOk,
     required this.onContinue,
     required this.onDetail,
   });
 
   @override
   Widget build(BuildContext context) {
-    final ok = verification.isAcceptable;
+    final ok = isOk;
     final grade = verification.overallGrade;
     final color = ok ? AppColors.ok : AppColors.nok;
     final bg = ok ? AppColors.okBg : AppColors.nokBg;

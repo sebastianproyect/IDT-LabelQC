@@ -123,80 +123,11 @@ class ISO15416Analyzer {
   }
 
   // ── JPEG path ────────────────────────────────────────────────────────────
+  // JPEG compression + ISP tone-mapping distort luminance values, making
+  // pixel-level ISO measurements unreliable. Return null → conservative fallback.
 
-  _ScanProfile? _profileFromJpeg(List<int> bytes, BarcodeAnalysisInput input) {
-    final decoded = img.decodeImage(bytes is Uint8List ? bytes : Uint8List.fromList(bytes));
-    if (decoded == null) return null;
-
-    final imgW = decoded.width;
-    final imgH = decoded.height;
-    final scaleX = imgW / (input.captureSize.width > 0 ? input.captureSize.width : imgW);
-    final scaleY = imgH / (input.captureSize.height > 0 ? input.captureSize.height : imgH);
-
-    final bb = input.boundingBox;
-    int x0, x1, y0, y1;
-    if (bb != null && bb.width > 10 && bb.height > 5) {
-      final padX = (bb.width * scaleX * 0.3).toInt();
-      final padY = (bb.height * scaleY * 0.5).toInt();
-      x0 = ((bb.left * scaleX).toInt() - padX).clamp(0, imgW - 1);
-      x1 = ((bb.right * scaleX).toInt() + padX).clamp(x0 + 1, imgW);
-      y0 = ((bb.top * scaleY).toInt() - padY).clamp(0, imgH - 1);
-      y1 = ((bb.bottom * scaleY).toInt() + padY).clamp(y0 + 1, imgH);
-    } else {
-      x0 = 0; x1 = imgW;
-      y0 = imgH ~/ 3; y1 = 2 * imgH ~/ 3;
-    }
-
-    final roiW = x1 - x0;
-    if (roiW < 20 || y1 - y0 < 3) return null;
-
-    int bestY = (y0 + y1) ~/ 2;
-    int bestTrans = 0;
-    for (int y = y0; y < y1; y += 2) {
-      int lo = 255, hi = 0;
-      for (int x = x0; x < x1; x++) {
-        final lv = _lum(decoded, x, y);
-        if (lv < lo) lo = lv;
-        if (lv > hi) hi = lv;
-      }
-      if (hi - lo < 20) continue;
-      final thresh = (lo + hi) ~/ 2;
-      int t = 0;
-      bool wasLight = _lum(decoded, x0, y) >= thresh;
-      for (int x = x0 + 1; x < x1; x++) {
-        final isLight = _lum(decoded, x, y) >= thresh;
-        if (isLight != wasLight) { t++; wasLight = isLight; }
-      }
-      if (t > bestTrans) { bestTrans = t; bestY = y; }
-    }
-    if (bestTrans < 6) return null;
-
-    final profile = <double>[];
-    for (int x = x0; x < x1; x++) {
-      double sum = 0;
-      int cnt = 0;
-      for (int dy = -1; dy <= 1; dy++) {
-        final y = bestY + dy;
-        if (y >= y0 && y < y1) { sum += _lum(decoded, x, y) / 255.0; cnt++; }
-      }
-      profile.add(cnt > 0 ? sum / cnt : 0.5);
-    }
-
-    final rMax = profile.reduce(max);
-    final rMin = profile.reduce(min);
-    if (rMax - rMin < 0.08) return null;
-
-    return _ScanProfile(
-      values: profile, rMax: rMax, rMin: rMin,
-      edges: _detectEdges(profile, rMax, rMin),
-    );
-  }
-
-  int _lum(img.Image image, int x, int y) {
-    final p = image.getPixel(
-      x.clamp(0, image.width - 1), y.clamp(0, image.height - 1));
-    return (0.299 * p.r + 0.587 * p.g + 0.114 * p.b).round().clamp(0, 255);
-  }
+  _ScanProfile? _profileFromJpeg(List<int> bytes, BarcodeAnalysisInput input) =>
+      null;
 
   // ── ISO calculations from profile ────────────────────────────────────────
 
@@ -219,50 +150,64 @@ class ISO15416Analyzer {
   }
 
   GradeValue _calcSC(_ScanProfile p) {
-    final pct = (p.rMax - p.rMin) * 100.0;
+    // Michelson contrast: (hi-lo)/(hi+lo) → robust to camera auto-exposure.
+    // Thresholds raised vs ISO because camera AGC inflates apparent contrast.
+    // Max grade: B — Grade A requires calibrated 670nm ISO verifier.
+    final michelson = (p.rMax - p.rMin) / (p.rMax + p.rMin + 0.001);
+    final pct = michelson * 100.0;
     ISOGrade g;
-    if (pct >= 70) g = ISOGrade.A;
-    else if (pct >= 55) g = ISOGrade.B;
+    if (pct >= 80) g = ISOGrade.B; // camera cannot certify Grade A
+    else if (pct >= 60) g = ISOGrade.B;
     else if (pct >= 40) g = ISOGrade.C;
-    else if (pct >= 20) g = ISOGrade.D;
+    else if (pct >= 22) g = ISOGrade.D;
     else g = ISOGrade.F;
-    return GradeValue(rawMeasurement: pct, unit: '%', grade: g, numericGrade: g.numeric);
+    return GradeValue(
+      rawMeasurement: pct, unit: '%', grade: g, numericGrade: g.numeric,
+      isEstimated: true, estimationBasis: '~Cámara — sin calibración ISO',
+    );
   }
 
   GradeValue _calcMR(_ScanProfile p) {
     final ok = p.rMin <= 0.5 * p.rMax;
-    final g = ok ? ISOGrade.A : ISOGrade.F;
-    return GradeValue(rawMeasurement: p.rMin * 100, unit: '%', grade: g, numericGrade: g.numeric);
+    final g = ok ? ISOGrade.B : ISOGrade.F; // max B: camera not calibrated
+    return GradeValue(
+      rawMeasurement: p.rMin * 100, unit: '%', grade: g, numericGrade: g.numeric,
+      isEstimated: true, estimationBasis: '~Cámara',
+    );
   }
 
   GradeValue _calcEC(_ScanProfile p) {
     if (p.edges.isEmpty) {
-      return GradeValue(rawMeasurement: 0, unit: 'ratio', grade: ISOGrade.F, numericGrade: 0);
+      return GradeValue(rawMeasurement: 0, unit: 'ratio', grade: ISOGrade.F, numericGrade: 0,
+        isEstimated: true, estimationBasis: '~Cámara');
     }
     final minEC = p.edges.map((e) => e.contrast).reduce(min);
     ISOGrade g;
-    if (minEC >= 0.15) g = ISOGrade.A;
+    if (minEC >= 0.15) g = ISOGrade.B; // camera cannot certify A
     else if (minEC >= 0.12) g = ISOGrade.B;
     else if (minEC >= 0.10) g = ISOGrade.C;
     else if (minEC >= 0.07) g = ISOGrade.D;
     else g = ISOGrade.F;
-    return GradeValue(rawMeasurement: minEC, unit: 'ratio', grade: g, numericGrade: g.numeric);
+    return GradeValue(rawMeasurement: minEC, unit: 'ratio', grade: g, numericGrade: g.numeric,
+      isEstimated: true, estimationBasis: '~Cámara');
   }
 
   GradeValue _calcMOD(_ScanProfile p, double sc, double ecMin) {
     final mod = sc > 0 ? (ecMin / sc).clamp(0.0, 1.0) : 0.0;
     ISOGrade g;
-    if (mod >= 0.70) g = ISOGrade.A;
+    if (mod >= 0.70) g = ISOGrade.B; // camera cannot certify A
     else if (mod >= 0.60) g = ISOGrade.B;
     else if (mod >= 0.50) g = ISOGrade.C;
     else if (mod >= 0.40) g = ISOGrade.D;
     else g = ISOGrade.F;
-    return GradeValue(rawMeasurement: mod, unit: 'ratio', grade: g, numericGrade: g.numeric);
+    return GradeValue(rawMeasurement: mod, unit: 'ratio', grade: g, numericGrade: g.numeric,
+      isEstimated: true, estimationBasis: '~Cámara');
   }
 
   GradeValue _calcDEF(_ScanProfile p, double sc) {
     if (p.edges.length < 2) {
-      return GradeValue(rawMeasurement: 0.05, unit: 'ratio', grade: ISOGrade.A, numericGrade: 4.0);
+      return GradeValue(rawMeasurement: 0.05, unit: 'ratio', grade: ISOGrade.B,
+        numericGrade: 3.0, isEstimated: true, estimationBasis: '~Cámara');
     }
     double maxERN = 0;
     for (int i = 1; i < p.values.length - 1; i++) {
@@ -271,12 +216,13 @@ class ISO15416Analyzer {
     }
     final def = sc > 0 ? (maxERN / sc).clamp(0.0, 1.0) : 1.0;
     ISOGrade g;
-    if (def <= 0.15) g = ISOGrade.A;
+    if (def <= 0.15) g = ISOGrade.B; // camera cannot certify A
     else if (def <= 0.20) g = ISOGrade.B;
     else if (def <= 0.25) g = ISOGrade.C;
     else if (def <= 0.30) g = ISOGrade.D;
     else g = ISOGrade.F;
-    return GradeValue(rawMeasurement: def, unit: 'ratio', grade: g, numericGrade: g.numeric);
+    return GradeValue(rawMeasurement: def, unit: 'ratio', grade: g, numericGrade: g.numeric,
+      isEstimated: true, estimationBasis: '~Cámara');
   }
 
   List<_Edge> _detectEdges(List<double> profile, double rMax, double rMin) {
@@ -479,69 +425,38 @@ class ISO15415Analyzer {
         stdDev: variance > 0 ? sqrt(variance) : 0.0);
   }
 
-  _2DMetrics? _metricsFromJpeg(List<int> bytes, BarcodeAnalysisInput input) {
-    final decoded = img.decodeImage(bytes is Uint8List ? bytes : Uint8List.fromList(bytes));
-    if (decoded == null) return null;
-
-    final imgW = decoded.width;
-    final imgH = decoded.height;
-    final scaleX = imgW / (input.captureSize.width > 0 ? input.captureSize.width : imgW);
-    final scaleY = imgH / (input.captureSize.height > 0 ? input.captureSize.height : imgH);
-
-    final bb = input.boundingBox;
-    int x0, x1, y0, y1;
-    if (bb != null && bb.width > 10 && bb.height > 10) {
-      x0 = (bb.left * scaleX).toInt().clamp(0, imgW - 1);
-      x1 = (bb.right * scaleX).toInt().clamp(x0 + 1, imgW);
-      y0 = (bb.top * scaleY).toInt().clamp(0, imgH - 1);
-      y1 = (bb.bottom * scaleY).toInt().clamp(y0 + 1, imgH);
-    } else {
-      x0 = imgW ~/ 4; x1 = 3 * imgW ~/ 4;
-      y0 = imgH ~/ 4; y1 = 3 * imgH ~/ 4;
-    }
-
-    double rMin = 1.0, rMax = 0.0, sum = 0.0, sumSq = 0.0;
-    int count = 0;
-    const step = 4;
-    for (int y = y0; y < y1; y += step) {
-      for (int x = x0; x < x1; x += step) {
-        final p = decoded.getPixel(x, y);
-        final lum = (0.299 * p.r + 0.587 * p.g + 0.114 * p.b) / 255.0;
-        if (lum < rMin) rMin = lum;
-        if (lum > rMax) rMax = lum;
-        sum += lum; sumSq += lum * lum; count++;
-      }
-    }
-    if (count == 0 || rMax - rMin < 0.10) return null;
-    final mean = sum / count;
-    final variance = (sumSq / count) - mean * mean;
-    return _2DMetrics(rMax: rMax, rMin: rMin, mean: mean,
-        stdDev: variance > 0 ? sqrt(variance) : 0.0);
-  }
+  // JPEG pixel analysis is unreliable for ISO measurements — skip entirely.
+  _2DMetrics? _metricsFromJpeg(List<int> bytes, BarcodeAnalysisInput input) =>
+      null;
 
   // ── Photometric from metrics ──────────────────────────────────────────────
 
   GradeValue _calcSCFromMetrics(_2DMetrics m) {
-    final pct = (m.rMax - m.rMin) * 100.0;
+    // Michelson contrast — robust to camera auto-exposure.
+    // Max grade B: camera cannot certify Grade A without calibrated hardware.
+    final michelson = (m.rMax - m.rMin) / (m.rMax + m.rMin + 0.001);
+    final pct = michelson * 100.0;
     ISOGrade g;
-    if (pct >= 70) g = ISOGrade.A;
-    else if (pct >= 55) g = ISOGrade.B;
+    if (pct >= 80) g = ISOGrade.B;
+    else if (pct >= 60) g = ISOGrade.B;
     else if (pct >= 40) g = ISOGrade.C;
-    else if (pct >= 20) g = ISOGrade.D;
+    else if (pct >= 22) g = ISOGrade.D;
     else g = ISOGrade.F;
-    return GradeValue(rawMeasurement: pct, unit: '%', grade: g, numericGrade: g.numeric);
+    return GradeValue(rawMeasurement: pct, unit: '%', grade: g, numericGrade: g.numeric,
+      isEstimated: true, estimationBasis: '~Cámara — sin calibración ISO');
   }
 
   GradeValue _calcMODFromMetrics(_2DMetrics m) {
     final range = m.rMax - m.rMin;
     final mod = range > 0 ? ((m.stdDev / range) * 2).clamp(0.0, 1.0) : 0.0;
     ISOGrade g;
-    if (mod >= 0.35) g = ISOGrade.A;
+    if (mod >= 0.35) g = ISOGrade.B;
     else if (mod >= 0.30) g = ISOGrade.B;
     else if (mod >= 0.25) g = ISOGrade.C;
     else if (mod >= 0.20) g = ISOGrade.D;
     else g = ISOGrade.F;
-    return GradeValue(rawMeasurement: mod, unit: 'ratio', grade: g, numericGrade: g.numeric);
+    return GradeValue(rawMeasurement: mod, unit: 'ratio', grade: g, numericGrade: g.numeric,
+      isEstimated: true, estimationBasis: '~Cámara');
   }
 
   GradeValue _calcDEFFromMetrics(_2DMetrics m) {
@@ -551,23 +466,25 @@ class ISO15415Analyzer {
         ? ((m.mean - expectedMean).abs() / range * 0.6).clamp(0.0, 1.0)
         : 1.0;
     ISOGrade g;
-    if (def <= 0.15) g = ISOGrade.A;
+    if (def <= 0.15) g = ISOGrade.B;
     else if (def <= 0.20) g = ISOGrade.B;
     else if (def <= 0.25) g = ISOGrade.C;
     else if (def <= 0.30) g = ISOGrade.D;
     else g = ISOGrade.F;
-    return GradeValue(rawMeasurement: def, unit: 'ratio', grade: g, numericGrade: g.numeric);
+    return GradeValue(rawMeasurement: def, unit: 'ratio', grade: g, numericGrade: g.numeric,
+      isEstimated: true, estimationBasis: '~Cámara');
   }
 
   GradeValue _calcPGFromMetrics(_2DMetrics m) {
     final pg = ((m.mean - 0.5).abs() * 20.0).clamp(0.0, 15.0);
     ISOGrade g;
-    if (pg <= 2.0) g = ISOGrade.A;
+    if (pg <= 2.0) g = ISOGrade.B;
     else if (pg <= 3.5) g = ISOGrade.B;
     else if (pg <= 5.0) g = ISOGrade.C;
     else if (pg <= 7.0) g = ISOGrade.D;
     else g = ISOGrade.F;
-    return GradeValue(rawMeasurement: pg, unit: '%', grade: g, numericGrade: g.numeric);
+    return GradeValue(rawMeasurement: pg, unit: '%', grade: g, numericGrade: g.numeric,
+      isEstimated: true, estimationBasis: '~Cámara');
   }
 
   // ── Geometric params ──────────────────────────────────────────────────────
