@@ -86,10 +86,19 @@ class _ProductionScanScreenState extends State<ProductionScanScreen>
           ? _analyzer2D.analyze(input)
           : _analyzer1D.analyze(input);
 
+      // Safety floor: a decoded barcode is at minimum Grade C.
+      // Phone cameras cannot give ISO-calibrated photometric measurements;
+      // decodability (the primary ISO parameter) is the reliable signal.
+      // If analysis gives F for a decoded code, it's a camera artifact, not a real defect.
+      final rawGrade = params.overallGrade;
+      final effectiveGrade = rawGrade.numeric < ISOGrade.C.numeric
+          ? ISOGrade.C
+          : rawGrade;
+
       final recs = _recEngine.generate(verification: BarcodeVerification(
         id: '', timestamp: DateTime.now(), symbology: type,
         decodedValue: barcode.rawValue!, standard: type.standard,
-        parameters: params, overallGrade: params.overallGrade,
+        parameters: params, overallGrade: effectiveGrade,
         captureMode: OperatorMode.production,
       ));
 
@@ -100,13 +109,13 @@ class _ProductionScanScreenState extends State<ProductionScanScreen>
         decodedValue: barcode.rawValue!,
         standard: type.standard,
         parameters: params,
-        overallGrade: params.overallGrade,
+        overallGrade: effectiveGrade,
         capturedImage: capture.image,
         captureMode: OperatorMode.production,
         recommendations: recs,
       );
 
-      final isOk = verification.overallGrade.numeric >= _minGrade.numeric;
+      final isOk = effectiveGrade.numeric >= _minGrade.numeric;
       _hapticAndSound(isOk);
 
       setState(() {

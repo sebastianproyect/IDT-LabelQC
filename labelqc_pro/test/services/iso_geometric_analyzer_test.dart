@@ -225,6 +225,101 @@ void main() {
 
       expect(params.symbolContrast.isEstimated, true);
     });
+
+    // ── Regression: DEF/EC/MOD were always F (root cause of "todo rechazado") ──
+    // These tests prevent the specific bugs from returning.
+
+    test('REGRESSION: DEF per-element — clean bars give Grade A, never F', () {
+      // Bug: max|profile[i]-profile[i-1]| over ALL pixels captured transitions
+      // (diff 0.35) → def=0.35/0.70=0.50 → always F.
+      // Fix: per-element ERN. Synthetic bars are perfectly uniform → ERN≈0 → A.
+      const W = 640, H = 480;
+      const bb = Rect.fromLTWH(80, 180, 480, 120);
+      final bytes = _makeSyntheticNV21(
+        width: W, height: H, barcodeRect: bb, symbolContrast: 0.70,
+      );
+      final input = BarcodeAnalysisInput(
+        rawValue: '12345678',
+        symbology: BarcodeType.code128,
+        boundingBox: bb,
+        captureSize: const Size(W.toDouble(), H.toDouble()),
+        imageBytes: bytes,
+      );
+      final params = analyzer.analyze(input);
+
+      // DEF must be A — synthetic bars are perfectly uniform within each element.
+      expect(params.defects.grade, ISOGrade.A,
+          reason: 'Uniform synthetic bars → per-element ERN≈0 → DEF must be Grade A');
+    });
+
+    test('REGRESSION: EC window-based — sharp transitions give Grade C or better', () {
+      // Bug: per-pixel diff at edge crossing = 0.02-0.08 → always F or D.
+      // Fix: window ±12px, localMax-localMin. Internal bar↔space EC ≈ 0.70 → A.
+      // Note: one boundary edge (barcode↔grey background) gives EC≈0.35 → C.
+      // The minimum across all edges is C. The key is it's NOT F.
+      const W = 640, H = 480;
+      const bb = Rect.fromLTWH(80, 180, 480, 120);
+      final bytes = _makeSyntheticNV21(
+        width: W, height: H, barcodeRect: bb, symbolContrast: 0.70,
+      );
+      final input = BarcodeAnalysisInput(
+        rawValue: '12345678',
+        symbology: BarcodeType.code128,
+        boundingBox: bb,
+        captureSize: const Size(W.toDouble(), H.toDouble()),
+        imageBytes: bytes,
+      );
+      final params = analyzer.analyze(input);
+
+      expect(params.edgeContrast!.grade.numeric,
+          greaterThanOrEqualTo(ISOGrade.C.numeric),
+          reason: 'Window-based EC must give C or better — was always F (bug)');
+    });
+
+    test('REGRESSION: MOD — correct EC gives MOD Grade C or better', () {
+      // Bug: MOD = brokenEC/SC = 0.05/0.70 = 0.07 → always F.
+      // Fix: with correct EC≈0.35 (min across edges), MOD=0.35/0.70=0.50 → C.
+      const W = 640, H = 480;
+      const bb = Rect.fromLTWH(80, 180, 480, 120);
+      final bytes = _makeSyntheticNV21(
+        width: W, height: H, barcodeRect: bb, symbolContrast: 0.70,
+      );
+      final input = BarcodeAnalysisInput(
+        rawValue: '12345678',
+        symbology: BarcodeType.code128,
+        boundingBox: bb,
+        captureSize: const Size(W.toDouble(), H.toDouble()),
+        imageBytes: bytes,
+      );
+      final params = analyzer.analyze(input);
+
+      expect(params.modulation.grade.numeric,
+          greaterThanOrEqualTo(ISOGrade.C.numeric),
+          reason: 'MOD must be C or better — was always F (bug)');
+    });
+
+    test('REGRESSION: full chain — decoded EAN-13 with 70% contrast → overall C or better', () {
+      // End-to-end regression. Before fix: overall = F (all 3 params = F).
+      // After fix: SC=A, DEF=A, EC=C, MOD=C, QZ=A (EAN-13 big margins) → overall = C.
+      // Uses EAN-13 (95 modules) so quiet zones are Grade A with 100px margins.
+      const W = 640, H = 480;
+      const bb = Rect.fromLTWH(100, 180, 400, 120); // left=100, right=500 → QZ=100/4.2=24 mod ≥ 7 req
+      final bytes = _makeSyntheticNV21(
+        width: W, height: H, barcodeRect: bb, symbolContrast: 0.70,
+      );
+      final input = BarcodeAnalysisInput(
+        rawValue: '5901234123457',
+        symbology: BarcodeType.ean13,
+        boundingBox: bb,
+        captureSize: const Size(W.toDouble(), H.toDouble()),
+        imageBytes: bytes,
+      );
+      final params = analyzer.analyze(input);
+
+      expect(params.overallGrade.numeric,
+          greaterThanOrEqualTo(ISOGrade.C.numeric),
+          reason: 'Good EAN-13 + 70% contrast NV21 → overall C or better. Before fix was F.');
+    });
   });
 
   // ─── ISO 15415 (2D) ────────────────────────────────────────────────────────
