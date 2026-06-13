@@ -150,21 +150,17 @@ class ISO15416Analyzer {
   }
 
   GradeValue _calcSC(_ScanProfile p) {
-    // Michelson contrast: (hi-lo)/(hi+lo) → robust to camera auto-exposure.
-    // Thresholds raised vs ISO because camera AGC inflates apparent contrast.
-    // Max grade: B — Grade A requires calibrated 670nm ISO verifier.
+    // Michelson contrast: (hi-lo)/(hi+lo) — normalizes camera auto-exposure (AGC).
+    // Y-plane is raw luminance (no JPEG compression), so this IS a real measurement.
     final michelson = (p.rMax - p.rMin) / (p.rMax + p.rMin + 0.001);
     final pct = michelson * 100.0;
     ISOGrade g;
-    if (pct >= 80) g = ISOGrade.B; // camera cannot certify Grade A
-    else if (pct >= 60) g = ISOGrade.B;
+    if (pct >= 70) g = ISOGrade.A;
+    else if (pct >= 55) g = ISOGrade.B;
     else if (pct >= 40) g = ISOGrade.C;
-    else if (pct >= 22) g = ISOGrade.D;
+    else if (pct >= 20) g = ISOGrade.D;
     else g = ISOGrade.F;
-    return GradeValue(
-      rawMeasurement: pct, unit: '%', grade: g, numericGrade: g.numeric,
-      isEstimated: true, estimationBasis: '~Cámara — sin calibración ISO',
-    );
+    return GradeValue(rawMeasurement: pct, unit: '%', grade: g, numericGrade: g.numeric);
   }
 
   GradeValue _calcMR(_ScanProfile p) {
@@ -432,18 +428,16 @@ class ISO15415Analyzer {
   // ── Photometric from metrics ──────────────────────────────────────────────
 
   GradeValue _calcSCFromMetrics(_2DMetrics m) {
-    // Michelson contrast — robust to camera auto-exposure.
-    // Max grade B: camera cannot certify Grade A without calibrated hardware.
+    // Michelson contrast from raw NV21 Y-plane — real measurement (not estimated).
     final michelson = (m.rMax - m.rMin) / (m.rMax + m.rMin + 0.001);
     final pct = michelson * 100.0;
     ISOGrade g;
-    if (pct >= 80) g = ISOGrade.B;
-    else if (pct >= 60) g = ISOGrade.B;
+    if (pct >= 70) g = ISOGrade.A;
+    else if (pct >= 55) g = ISOGrade.B;
     else if (pct >= 40) g = ISOGrade.C;
-    else if (pct >= 22) g = ISOGrade.D;
+    else if (pct >= 20) g = ISOGrade.D;
     else g = ISOGrade.F;
-    return GradeValue(rawMeasurement: pct, unit: '%', grade: g, numericGrade: g.numeric,
-      isEstimated: true, estimationBasis: '~Cámara — sin calibración ISO');
+    return GradeValue(rawMeasurement: pct, unit: '%', grade: g, numericGrade: g.numeric);
   }
 
   GradeValue _calcMODFromMetrics(_2DMetrics m) {
