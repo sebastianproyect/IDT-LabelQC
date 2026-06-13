@@ -9,17 +9,15 @@ import '../../domain/entities/entities.dart';
 // ═══════════════════════════════════════════════════════
 //
 // Format detection strategy (in order):
-//  1. NV21/YUV420: bytes.length >= W*H — first W*H bytes = pure luminance.
-//     Most common Android camera format. isEstimated: false.
-//  2. JPEG: bytes start with 0xFF 0xD8 — decode with image package.
-//     Some devices/mobile_scanner versions return compressed JPEG.
-//     isEstimated: false.
-//  3. Conservative fallback: Grade C (not B). Grade C is the documented
-//     minimum ML Kit requires to decode (~40% SC). Using B was wrong
-//     because ML Kit reads at 15-20% SC (well below ISO Grade D).
+//  1. NV21/YUV420: first W*H bytes = pure luminance (Y-plane). Real measurement.
+//  2. JPEG: magic FF D8 FF (3 bytes). Pixel analysis unreliable → null → fallback.
+//  3. Conservative fallback: Grade C if decoded, F if not.
 //
-// The ~est. badge in the UI signals which mode is in use.
-// If ALL parameters show ~est. → device returns an unrecognized format.
+// Key fix: EC, MOD, DEF were computing per-pixel adjacent differences which always
+// captured BAR↔SPACE transitions → always F. Fixed to use proper ISO semantics:
+//  - EC: local peak/valley contrast at each transition (window-based)
+//  - MOD: EC_min / SC (meaningful with correct EC)
+//  - DEF: per-element non-uniformity (within each bar/space, NOT across transitions)
 
 class ISO15416Analyzer {
   ISOParameters analyze(BarcodeAnalysisInput input) {
@@ -31,7 +29,7 @@ class ISO15416Analyzer {
     return _conservativeFallback(decoded, input);
   }
 
-  // ── Format detection & extraction ────────────────────────────────────────
+  // ── Format detection ─────────────────────────────────────────────────────
 
   _ScanProfile? _extractScanProfile(BarcodeAnalysisInput input) {
     final bytes = input.imageBytes;
@@ -41,14 +39,13 @@ class ISO15416Analyzer {
     final H = input.captureSize.height.round();
     if (W <= 0 || H <= 0) return null;
 
-    // IMPORTANT: Check JPEG *first* — a high-quality JPEG can be > W*H bytes
-    // and would be misidentified as NV21 if we checked length first.
-    // Path 1: JPEG (magic bytes FF D8 FF)
-    if (bytes.length > 3 && bytes[0] == 0xFF && bytes[1] == 0xD8) {
+    // JPEG magic = FF D8 FF (3 bytes). Only 2-byte check risks false-positives
+    // with NV21 when first pixel=255 (white bg) and second≈216. Require 3 bytes.
+    if (bytes.length > 3 &&
+        bytes[0] == 0xFF && bytes[1] == 0xD8 && bytes[2] == 0xFF) {
       return _profileFromJpeg(bytes, input);
     }
 
-    // Path 2: NV21 / YUV420 raw bytes — Y-plane = first W*H bytes
     if (bytes.length >= W * H) {
       return _profileFromYPlane(bytes, W, H, input);
     }
@@ -56,15 +53,15 @@ class ISO15416Analyzer {
     return null;
   }
 
-  // ── NV21 Y-plane path ────────────────────────────────────────────────────
+  // ── NV21 Y-plane ─────────────────────────────────────────────────────────
 
   _ScanProfile? _profileFromYPlane(
       List<int> bytes, int W, int H, BarcodeAnalysisInput input) {
     final bb = input.boundingBox;
     int x0, x1, y0, y1;
     if (bb != null && bb.width > 10 && bb.height > 5) {
-      final padX = (bb.width * 0.4).toInt();
-      final padY = (bb.height * 0.6).toInt();
+      final padX = (bb.width * 0.3).toInt();
+      final padY = (bb.height * 0.5).toInt();
       x0 = (bb.left.toInt() - padX).clamp(0, W - 1);
       x1 = (bb.right.toInt() + padX).clamp(x0 + 1, W);
       y0 = (bb.top.toInt() - padY).clamp(0, H - 1);
@@ -76,6 +73,7 @@ class ISO15416Analyzer {
     final roiW = x1 - x0;
     if (roiW < 20 || y1 - y0 < 3) return null;
 
+    // Find the row with the most bar-space transitions
     int bestY = (y0 + y1) ~/ 2;
     int bestTransitions = 0;
     for (int y = y0; y < y1; y += 2) {
@@ -99,6 +97,7 @@ class ISO15416Analyzer {
     }
     if (bestTransitions < 6) return null;
 
+    // Average 3 rows around bestY for noise reduction
     final profile = List<double>.filled(roiW, 0.0);
     int rowCount = 0;
     for (int dy = -1; dy <= 1; dy++) {
@@ -122,14 +121,11 @@ class ISO15416Analyzer {
     );
   }
 
-  // ── JPEG path ────────────────────────────────────────────────────────────
-  // JPEG compression + ISP tone-mapping distort luminance values, making
-  // pixel-level ISO measurements unreliable. Return null → conservative fallback.
-
+  // JPEG pixel data is distorted by compression + ISP → unreliable.
   _ScanProfile? _profileFromJpeg(List<int> bytes, BarcodeAnalysisInput input) =>
       null;
 
-  // ── ISO calculations from profile ────────────────────────────────────────
+  // ── ISO 15416 calculations ────────────────────────────────────────────────
 
   ISOParameters _analyzeFromProfile(
       _ScanProfile p, bool decoded, BarcodeAnalysisInput input) {
@@ -137,7 +133,7 @@ class ISO15416Analyzer {
     final mr = _calcMR(p);
     final ec = _calcEC(p);
     final mod = _calcMOD(p, sc.rawMeasurement / 100.0, ec.rawMeasurement);
-    final def = _calcDEF(p, sc.rawMeasurement / 100.0);
+    final def = _calcDEF(p, p.rMax - p.rMin);
     return ISOParameters(
       symbolContrast: sc,
       minimumReflectance: mr,
@@ -149,9 +145,8 @@ class ISO15416Analyzer {
     );
   }
 
+  // SC: Michelson contrast from Y-plane — real measurement, allows Grade A.
   GradeValue _calcSC(_ScanProfile p) {
-    // Michelson contrast: (hi-lo)/(hi+lo) — normalizes camera auto-exposure (AGC).
-    // Y-plane is raw luminance (no JPEG compression), so this IS a real measurement.
     final michelson = (p.rMax - p.rMin) / (p.rMax + p.rMin + 0.001);
     final pct = michelson * 100.0;
     ISOGrade g;
@@ -163,62 +158,99 @@ class ISO15416Analyzer {
     return GradeValue(rawMeasurement: pct, unit: '%', grade: g, numericGrade: g.numeric);
   }
 
+  // MR: bars must be darker than spaces. Camera can verify this relative check.
   GradeValue _calcMR(_ScanProfile p) {
     final ok = p.rMin <= 0.5 * p.rMax;
-    final g = ok ? ISOGrade.B : ISOGrade.F; // max B: camera not calibrated
+    // Never F from camera — MR failure is a mild warning (Grade B), not a reject.
+    final g = ok ? ISOGrade.A : ISOGrade.B;
     return GradeValue(
       rawMeasurement: p.rMin * 100, unit: '%', grade: g, numericGrade: g.numeric,
       isEstimated: true, estimationBasis: '~Cámara',
     );
   }
 
+  // EC FIX: local peak/valley at each transition (not adjacent-pixel diff).
+  // For each edge, examine a ±window pixel region to find max (space) and
+  // min (bar) reflectance. EC = max - min at that transition.
+  // This gives the actual step amplitude, which is meaningful from camera data.
   GradeValue _calcEC(_ScanProfile p) {
     if (p.edges.isEmpty) {
-      return GradeValue(rawMeasurement: 0, unit: 'ratio', grade: ISOGrade.F, numericGrade: 0,
-        isEstimated: true, estimationBasis: '~Cámara');
+      return GradeValue(rawMeasurement: 0, unit: 'ratio', grade: ISOGrade.F,
+        numericGrade: 0, isEstimated: true, estimationBasis: '~Cámara');
     }
-    final minEC = p.edges.map((e) => e.contrast).reduce(min);
+    const window = 12;
+    double minEC = 1.0;
+    for (final edge in p.edges) {
+      final pos = edge.position.round();
+      final lo = (pos - window).clamp(0, p.values.length - 1);
+      final hi = (pos + window).clamp(0, p.values.length - 1);
+      double localMin = p.values[lo], localMax = p.values[lo];
+      for (int i = lo; i <= hi; i++) {
+        if (p.values[i] < localMin) localMin = p.values[i];
+        if (p.values[i] > localMax) localMax = p.values[i];
+      }
+      final ec = localMax - localMin;
+      if (ec < minEC) minEC = ec;
+    }
     ISOGrade g;
-    if (minEC >= 0.15) g = ISOGrade.B; // camera cannot certify A
-    else if (minEC >= 0.12) g = ISOGrade.B;
-    else if (minEC >= 0.10) g = ISOGrade.C;
-    else if (minEC >= 0.07) g = ISOGrade.D;
+    if (minEC >= 0.55) g = ISOGrade.A;
+    else if (minEC >= 0.45) g = ISOGrade.B;
+    else if (minEC >= 0.35) g = ISOGrade.C;
+    else if (minEC >= 0.20) g = ISOGrade.D;
     else g = ISOGrade.F;
-    return GradeValue(rawMeasurement: minEC, unit: 'ratio', grade: g, numericGrade: g.numeric,
-      isEstimated: true, estimationBasis: '~Cámara');
+    return GradeValue(rawMeasurement: minEC, unit: 'ratio', grade: g,
+      numericGrade: g.numeric, isEstimated: true, estimationBasis: '~Cámara');
   }
 
+  // MOD FIX: EC_min / SC. Now meaningful because EC is computed correctly.
   GradeValue _calcMOD(_ScanProfile p, double sc, double ecMin) {
     final mod = sc > 0 ? (ecMin / sc).clamp(0.0, 1.0) : 0.0;
     ISOGrade g;
-    if (mod >= 0.70) g = ISOGrade.B; // camera cannot certify A
-    else if (mod >= 0.60) g = ISOGrade.B;
-    else if (mod >= 0.50) g = ISOGrade.C;
-    else if (mod >= 0.40) g = ISOGrade.D;
+    if (mod >= 0.70) g = ISOGrade.A;
+    else if (mod >= 0.55) g = ISOGrade.B;
+    else if (mod >= 0.40) g = ISOGrade.C;
+    else if (mod >= 0.25) g = ISOGrade.D;
     else g = ISOGrade.F;
-    return GradeValue(rawMeasurement: mod, unit: 'ratio', grade: g, numericGrade: g.numeric,
-      isEstimated: true, estimationBasis: '~Cámara');
+    return GradeValue(rawMeasurement: mod, unit: 'ratio', grade: g,
+      numericGrade: g.numeric, isEstimated: true, estimationBasis: '~Cámara');
   }
 
-  GradeValue _calcDEF(_ScanProfile p, double sc) {
-    if (p.edges.length < 2) {
-      return GradeValue(rawMeasurement: 0.05, unit: 'ratio', grade: ISOGrade.B,
-        numericGrade: 3.0, isEstimated: true, estimationBasis: '~Cámara');
+  // DEF FIX: per-element non-uniformity — measures within each bar/space,
+  // NOT across transitions. For clean bars: elements are nearly uniform → A.
+  // For spotted/dirty bars: element has local lighter area → D or F.
+  GradeValue _calcDEF(_ScanProfile p, double range) {
+    final edgePos = p.edges.map((e) => e.position).toList();
+    if (edgePos.length < 2) {
+      return GradeValue(rawMeasurement: 0.05, unit: 'ratio', grade: ISOGrade.A,
+        numericGrade: 4.0, isEstimated: true, estimationBasis: '~Cámara');
     }
-    double maxERN = 0;
-    for (int i = 1; i < p.values.length - 1; i++) {
-      final e = (p.values[i] - p.values[i - 1]).abs();
-      if (e > maxERN) maxERN = e;
+
+    final boundaries = <double>[0, ...edgePos, p.values.length.toDouble()];
+    double maxERN = 0.0;
+
+    for (int i = 0; i < boundaries.length - 1; i++) {
+      final start = boundaries[i].round().clamp(0, p.values.length - 1);
+      final end = boundaries[i + 1].round().clamp(start, p.values.length);
+      if (end - start < 3) continue; // element too narrow to measure
+
+      double eMin = p.values[start], eMax = p.values[start];
+      for (int j = start + 1; j < end; j++) {
+        if (p.values[j] < eMin) eMin = p.values[j];
+        if (p.values[j] > eMax) eMax = p.values[j];
+      }
+      final ern = eMax - eMin;
+      if (ern > maxERN) maxERN = ern;
     }
-    final def = sc > 0 ? (maxERN / sc).clamp(0.0, 1.0) : 1.0;
+
+    final def = range > 0 ? (maxERN / range).clamp(0.0, 1.0) : 1.0;
     ISOGrade g;
-    if (def <= 0.15) g = ISOGrade.B; // camera cannot certify A
+    if (def <= 0.15) g = ISOGrade.A;
     else if (def <= 0.20) g = ISOGrade.B;
     else if (def <= 0.25) g = ISOGrade.C;
     else if (def <= 0.30) g = ISOGrade.D;
     else g = ISOGrade.F;
-    return GradeValue(rawMeasurement: def, unit: 'ratio', grade: g, numericGrade: g.numeric,
-      isEstimated: true, estimationBasis: '~Cámara');
+    return GradeValue(rawMeasurement: def, unit: 'ratio', grade: g,
+      numericGrade: g.numeric, isEstimated: true, estimationBasis: '~Cámara');
   }
 
   List<_Edge> _detectEdges(List<double> profile, double rMax, double rMin) {
@@ -271,13 +303,11 @@ class ISO15416Analyzer {
     return GradeValue(rawMeasurement: qzMods, unit: 'X', grade: g, numericGrade: g.numeric);
   }
 
-  // ── Conservative fallback — no usable image ───────────────────────────────
-  // Grade C = minimum ML Kit requires. NEVER Grade B.
-  // (ML Kit decodes at ~15% SC which is ISO Grade F)
+  // ── Conservative fallback ─────────────────────────────────────────────────
 
   ISOParameters _conservativeFallback(bool decoded, BarcodeAnalysisInput input) {
     final g = decoded ? ISOGrade.C : ISOGrade.F;
-    const basis = 'Estimación — formato de imagen no reconocido o sin imagen';
+    const basis = 'Estimación — sin imagen analizable';
     GradeValue est(double raw, String unit) => GradeValue(
       rawMeasurement: raw, unit: unit, grade: g, numericGrade: g.numeric,
       isEstimated: true, estimationBasis: basis,
@@ -285,9 +315,9 @@ class ISO15416Analyzer {
     return ISOParameters(
       symbolContrast: est(decoded ? 40.0 : 10.0, '%'),
       minimumReflectance: est(decoded ? 30.0 : 80.0, '%'),
-      edgeContrast: est(decoded ? 0.10 : 0.02, 'ratio'),
+      edgeContrast: est(decoded ? 0.40 : 0.05, 'ratio'),
       modulation: est(decoded ? 0.50 : 0.05, 'ratio'),
-      defects: est(decoded ? 0.25 : 0.90, 'ratio'),
+      defects: est(decoded ? 0.20 : 0.90, 'ratio'),
       decodability: _calcDecodability(decoded),
       quietZones: _calcQuietZones(input),
     );
@@ -350,8 +380,8 @@ class ISO15415Analyzer {
 
     final metrics = _extract2DMetrics(input);
     final sc = metrics != null ? _calcSCFromMetrics(metrics) : _est(decoded, 40.0, 10.0, '%');
-    final mod = metrics != null ? _calcMODFromMetrics(metrics) : _est(decoded, 0.25, 0.0, 'ratio');
-    final def = metrics != null ? _calcDEFFromMetrics(metrics) : _est(decoded, 0.25, 0.90, 'ratio');
+    final mod = metrics != null ? _calcMODFromMetrics(metrics) : _est(decoded, 0.50, 0.05, 'ratio');
+    final def = metrics != null ? _calcDEFFromMetrics(metrics) : _est(decoded, 0.20, 0.90, 'ratio');
     final pg = metrics != null ? _calcPGFromMetrics(metrics) : _est(decoded, 5.0, 15.0, '%');
 
     return ISOParameters(
@@ -367,7 +397,7 @@ class ISO15415Analyzer {
     );
   }
 
-  // ── Metrics extraction (NV21 or JPEG) ────────────────────────────────────
+  // ── 2D metrics extraction ─────────────────────────────────────────────────
 
   _2DMetrics? _extract2DMetrics(BarcodeAnalysisInput input) {
     final bytes = input.imageBytes;
@@ -377,8 +407,9 @@ class ISO15415Analyzer {
     final H = input.captureSize.height.round();
     if (W <= 0 || H <= 0) return null;
 
-    // JPEG first (large JPEGs can be > W*H bytes → misidentified as NV21)
-    if (bytes.length > 3 && bytes[0] == 0xFF && bytes[1] == 0xD8) {
+    // 3-byte JPEG check prevents false positive with bright NV21 frames.
+    if (bytes.length > 3 &&
+        bytes[0] == 0xFF && bytes[1] == 0xD8 && bytes[2] == 0xFF) {
       return _metricsFromJpeg(bytes, input);
     }
     if (bytes.length >= W * H) return _metricsFromYPlane(bytes, W, H, input);
@@ -395,8 +426,9 @@ class ISO15415Analyzer {
       y0 = bb.top.toInt().clamp(0, H - 1);
       y1 = bb.bottom.toInt().clamp(y0 + 1, H);
     } else {
-      x0 = W ~/ 4; x1 = 3 * W ~/ 4;
-      y0 = H ~/ 4; y1 = 3 * H ~/ 4;
+      // Tighter fallback ROI — wide ROI biases mean towards white background.
+      x0 = W ~/ 3; x1 = 2 * W ~/ 3;
+      y0 = H ~/ 3; y1 = 2 * H ~/ 3;
     }
     if (x1 - x0 < 10 || y1 - y0 < 10) return null;
 
@@ -421,14 +453,13 @@ class ISO15415Analyzer {
         stdDev: variance > 0 ? sqrt(variance) : 0.0);
   }
 
-  // JPEG pixel analysis is unreliable for ISO measurements — skip entirely.
   _2DMetrics? _metricsFromJpeg(List<int> bytes, BarcodeAnalysisInput input) =>
       null;
 
-  // ── Photometric from metrics ──────────────────────────────────────────────
+  // ── 2D photometric parameters ─────────────────────────────────────────────
 
+  // SC: Michelson from NV21 Y-plane — real measurement.
   GradeValue _calcSCFromMetrics(_2DMetrics m) {
-    // Michelson contrast from raw NV21 Y-plane — real measurement (not estimated).
     final michelson = (m.rMax - m.rMin) / (m.rMax + m.rMin + 0.001);
     final pct = michelson * 100.0;
     ISOGrade g;
@@ -440,48 +471,60 @@ class ISO15415Analyzer {
     return GradeValue(rawMeasurement: pct, unit: '%', grade: g, numericGrade: g.numeric);
   }
 
+  // MOD: bimodality proxy — a well-modulated QR has high std dev relative to range.
   GradeValue _calcMODFromMetrics(_2DMetrics m) {
     final range = m.rMax - m.rMin;
+    // Bimodal distribution (50% dark/50% light, mean at midpoint): stdDev/range ≈ 0.5.
+    // Scale ×2 so a perfect QR gives mod ≈ 1.0.
     final mod = range > 0 ? ((m.stdDev / range) * 2).clamp(0.0, 1.0) : 0.0;
     ISOGrade g;
-    if (mod >= 0.35) g = ISOGrade.B;
-    else if (mod >= 0.30) g = ISOGrade.B;
-    else if (mod >= 0.25) g = ISOGrade.C;
-    else if (mod >= 0.20) g = ISOGrade.D;
+    if (mod >= 0.70) g = ISOGrade.A;
+    else if (mod >= 0.55) g = ISOGrade.B;
+    else if (mod >= 0.40) g = ISOGrade.C;
+    else if (mod >= 0.25) g = ISOGrade.D;
     else g = ISOGrade.F;
-    return GradeValue(rawMeasurement: mod, unit: 'ratio', grade: g, numericGrade: g.numeric,
-      isEstimated: true, estimationBasis: '~Cámara');
+    return GradeValue(rawMeasurement: mod, unit: 'ratio', grade: g,
+      numericGrade: g.numeric, isEstimated: true, estimationBasis: '~Cámara');
   }
 
+  // DEF: how far the actual mean deviates from the ideal midpoint (dark/light balance).
   GradeValue _calcDEFFromMetrics(_2DMetrics m) {
     final range = m.rMax - m.rMin;
     final expectedMean = (m.rMin + m.rMax) / 2;
+    // Normalize: max deviation is 0.5×range (mean at one extreme) → scale to 0-1.
     final def = range > 0
-        ? ((m.mean - expectedMean).abs() / range * 0.6).clamp(0.0, 1.0)
+        ? ((m.mean - expectedMean).abs() / range).clamp(0.0, 1.0)
         : 1.0;
     ISOGrade g;
-    if (def <= 0.15) g = ISOGrade.B;
+    if (def <= 0.15) g = ISOGrade.A;
     else if (def <= 0.20) g = ISOGrade.B;
-    else if (def <= 0.25) g = ISOGrade.C;
-    else if (def <= 0.30) g = ISOGrade.D;
+    else if (def <= 0.30) g = ISOGrade.C;
+    else if (def <= 0.40) g = ISOGrade.D;
     else g = ISOGrade.F;
-    return GradeValue(rawMeasurement: def, unit: 'ratio', grade: g, numericGrade: g.numeric,
-      isEstimated: true, estimationBasis: '~Cámara');
+    return GradeValue(rawMeasurement: def, unit: 'ratio', grade: g,
+      numericGrade: g.numeric, isEstimated: true, estimationBasis: '~Cámara');
   }
 
+  // PG: print growth (ink gain) — inferred from mean vs ideal midpoint.
+  // Tight ROI (bounding box) reduces background bias.
   GradeValue _calcPGFromMetrics(_2DMetrics m) {
-    final pg = ((m.mean - 0.5).abs() * 20.0).clamp(0.0, 15.0);
+    // Mean below midpoint → too much ink (print gain). Above → too little.
+    final midpoint = (m.rMin + m.rMax) / 2;
+    final deviation = (m.mean - midpoint).abs();
+    final range = m.rMax - m.rMin;
+    // Express as % of range so it's comparable across different contrast levels.
+    final pg = range > 0 ? (deviation / range * 100.0).clamp(0.0, 50.0) : 50.0;
     ISOGrade g;
-    if (pg <= 2.0) g = ISOGrade.B;
-    else if (pg <= 3.5) g = ISOGrade.B;
-    else if (pg <= 5.0) g = ISOGrade.C;
-    else if (pg <= 7.0) g = ISOGrade.D;
+    if (pg <= 10.0) g = ISOGrade.A;
+    else if (pg <= 15.0) g = ISOGrade.B;
+    else if (pg <= 22.0) g = ISOGrade.C;
+    else if (pg <= 30.0) g = ISOGrade.D;
     else g = ISOGrade.F;
-    return GradeValue(rawMeasurement: pg, unit: '%', grade: g, numericGrade: g.numeric,
-      isEstimated: true, estimationBasis: '~Cámara');
+    return GradeValue(rawMeasurement: pg, unit: '%', grade: g,
+      numericGrade: g.numeric, isEstimated: true, estimationBasis: '~Cámara');
   }
 
-  // ── Geometric params ──────────────────────────────────────────────────────
+  // ── 2D geometric parameters ───────────────────────────────────────────────
 
   GradeValue _calcDecodability(bool decoded) {
     final g = decoded ? ISOGrade.A : ISOGrade.F;
