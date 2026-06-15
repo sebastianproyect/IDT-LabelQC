@@ -1,3 +1,4 @@
+import 'dart:async';
 import 'dart:typed_data';
 import 'package:flutter/material.dart';
 import 'package:flutter/services.dart';
@@ -20,8 +21,9 @@ class ProductionScanScreen extends StatefulWidget {
 
 class _ProductionScanScreenState extends State<ProductionScanScreen>
     with TickerProviderStateMixin {
+  // Normal speed: fires every ~200ms so _pendingCapture is always a fresh frame.
   final MobileScannerController _scanner = MobileScannerController(
-    detectionSpeed: DetectionSpeed.noDuplicates,
+    detectionSpeed: DetectionSpeed.normal,
     facing: CameraFacing.back,
     formats: [BarcodeFormat.all],
     returnImage: true,
@@ -30,12 +32,22 @@ class _ProductionScanScreenState extends State<ProductionScanScreen>
   bool _torchOn = false;
   bool _isAnalyzing = false;
   bool _showResult = false;
-  bool _lastWasBlurry = false;
+  bool _isBlurry = false;
   BarcodeVerification? _lastResult;
   ISOGrade _minGrade = ISOGrade.C;
 
+  // The last barcode detected in the scan zone — updated continuously.
+  // Null means no barcode currently in zone.
+  BarcodeCapture? _pendingCapture;
+  bool _barcodeInZone = false;
+
+  // Clears the zone indicator if no detection arrives for 1.5s
+  // (barcode left the frame or moved out of zone).
+  Timer? _clearZoneTimer;
+
   late AnimationController _resultAnim;
   late Animation<double> _resultScale;
+  late AnimationController _pulseAnim;
 
   final ISO15415Analyzer _analyzer2D = ISO15415Analyzer();
   final ISO15416Analyzer _analyzer1D = ISO15416Analyzer();
@@ -44,8 +56,16 @@ class _ProductionScanScreenState extends State<ProductionScanScreen>
   @override
   void initState() {
     super.initState();
-    _resultAnim = AnimationController(vsync: this, duration: const Duration(milliseconds: 350));
-    _resultScale = CurvedAnimation(parent: _resultAnim, curve: Curves.elasticOut);
+    _resultAnim = AnimationController(
+        vsync: this, duration: const Duration(milliseconds: 350));
+    _resultScale =
+        CurvedAnimation(parent: _resultAnim, curve: Curves.elasticOut);
+    _pulseAnim = AnimationController(
+        vsync: this,
+        duration: const Duration(milliseconds: 900),
+        lowerBound: 0.85,
+        upperBound: 1.0)
+      ..repeat(reverse: true);
     _loadSettings();
   }
 
@@ -63,50 +83,62 @@ class _ProductionScanScreenState extends State<ProductionScanScreen>
   void dispose() {
     _scanner.dispose();
     _resultAnim.dispose();
+    _pulseAnim.dispose();
+    _clearZoneTimer?.cancel();
     super.dispose();
   }
 
-  // Rejects detections that are too small or outside the scan zone.
-  // Prevents triggering on background barcodes, logos, or shelf labels nearby.
-  bool _isValidDetection(BarcodeCapture capture, Barcode barcode) {
-    final bb = _cornersToRect(barcode.corners);
-    if (bb == null) return true;
-
-    final frameW = capture.size.width;
-    final frameH = capture.size.height;
-    if (frameW <= 0 || frameH <= 0) return true;
-
-    // Barcode must occupy at least 20% of frame width.
-    // Background barcodes or accidental reads are typically much smaller.
-    if (bb.width < frameW * 0.20) return false;
-
-    // Barcode center must be within the central 60% of frame height.
-    // This matches the visual scan zone (30% height centered at 50%).
-    final centerY = bb.center.dy;
-    if (centerY < frameH * 0.20 || centerY > frameH * 0.80) return false;
-
-    return true;
-  }
-
-  void _onDetect(BarcodeCapture capture) async {
+  // Called continuously by mobile_scanner (~200ms intervals).
+  // Only stores the capture — does NOT analyze. Analysis runs on button press.
+  void _onDetect(BarcodeCapture capture) {
     if (_isAnalyzing || _showResult) return;
     final barcode = capture.barcodes.firstOrNull;
     if (barcode == null || barcode.rawValue == null) return;
 
-    // Smart filter: skip barcodes too small or outside the scan zone
+    final bbox = _cornersToRect(barcode.corners);
     if (!_isValidDetection(capture, barcode)) return;
 
-    // Sharpness check: if the image is blurry the photometric analysis is
-    // unreliable. Show a warning and skip this frame instead of giving a
-    // misleading grade.
-    final bbox = _cornersToRect(barcode.corners);
-    if (!_isSharpEnough(capture.image, capture.size, bbox)) {
-      if (mounted) setState(() => _lastWasBlurry = true);
-      return;
-    }
-    if (mounted) setState(() => _lastWasBlurry = false);
+    final blurry = !_isSharpEnough(capture.image, capture.size, bbox);
 
-    setState(() => _isAnalyzing = true);
+    // Restart the "barcode left frame" timer on every fresh detection.
+    _clearZoneTimer?.cancel();
+    _clearZoneTimer = Timer(const Duration(milliseconds: 1500), () {
+      if (mounted) {
+        setState(() {
+          _barcodeInZone = false;
+          _pendingCapture = null;
+          _isBlurry = false;
+        });
+      }
+    });
+
+    if (mounted) {
+      setState(() {
+        _pendingCapture = capture;
+        _barcodeInZone = true;
+        _isBlurry = blurry;
+      });
+    }
+  }
+
+  // Triggered by the capture button. Analyzes the last stored frame.
+  Future<void> _onCapturePressed() async {
+    final capture = _pendingCapture;
+    if (capture == null || _isAnalyzing || _showResult) return;
+
+    // Snapshot immediately to avoid race with next onDetect call.
+    final barcode = capture.barcodes.firstOrNull;
+    if (barcode == null || barcode.rawValue == null) return;
+
+    _clearZoneTimer?.cancel();
+    setState(() {
+      _isAnalyzing = true;
+      _barcodeInZone = false;
+      _pendingCapture = null;
+      _isBlurry = false;
+    });
+
+    HapticFeedback.mediumImpact();
 
     try {
       final type = _mapFormat(barcode.format);
@@ -119,23 +151,25 @@ class _ProductionScanScreenState extends State<ProductionScanScreen>
         imageBytes: capture.image,
       );
 
-      final params = type.is2D
-          ? _analyzer2D.analyze(input)
-          : _analyzer1D.analyze(input);
+      final params =
+          type.is2D ? _analyzer2D.analyze(input) : _analyzer1D.analyze(input);
 
-      // Safety floor only when the camera gave NO image bytes.
-      // With image bytes (NV21), the photometric analysis is real — trust it.
-      // Without image bytes we have no signal besides decodability, so a
-      // decoded code is conservatively floored at Grade C.
+      // Safety floor only when camera gave NO image bytes.
       final rawGrade = params.overallGrade;
-      final effectiveGrade = (input.imageBytes == null && rawGrade.numeric < ISOGrade.C.numeric)
-          ? ISOGrade.C
-          : rawGrade;
+      final effectiveGrade =
+          (input.imageBytes == null && rawGrade.numeric < ISOGrade.C.numeric)
+              ? ISOGrade.C
+              : rawGrade;
 
-      final recs = _recEngine.generate(verification: BarcodeVerification(
-        id: '', timestamp: DateTime.now(), symbology: type,
-        decodedValue: barcode.rawValue!, standard: type.standard,
-        parameters: params, overallGrade: effectiveGrade,
+      final recs = _recEngine.generate(
+          verification: BarcodeVerification(
+        id: '',
+        timestamp: DateTime.now(),
+        symbology: type,
+        decodedValue: barcode.rawValue!,
+        standard: type.standard,
+        parameters: params,
+        overallGrade: effectiveGrade,
         captureMode: OperatorMode.production,
       ));
 
@@ -153,65 +187,17 @@ class _ProductionScanScreenState extends State<ProductionScanScreen>
       );
 
       final isOk = effectiveGrade.numeric >= _minGrade.numeric;
-      _hapticAndSound(isOk);
+      isOk ? HapticFeedback.lightImpact() : HapticFeedback.heavyImpact();
 
       setState(() {
         _lastResult = verification;
         _isAnalyzing = false;
         _showResult = true;
-        _lastWasBlurry = false;
       });
       _resultAnim.forward(from: 0);
-
-    } catch (e) {
+    } catch (_) {
       setState(() => _isAnalyzing = false);
     }
-  }
-
-  void _hapticAndSound(bool ok) {
-    if (ok) {
-      HapticFeedback.lightImpact();
-    } else {
-      HapticFeedback.heavyImpact();
-    }
-  }
-
-  // Returns false when the NV21 image is too blurry for reliable photometric
-  // analysis. Measures the steepness of the sharpest edge in the barcode row:
-  // a focused barcode has edges that jump ≥ 18% of the total range in one pixel.
-  bool _isSharpEnough(Uint8List? bytes, Size captureSize, Rect? bbox) {
-    if (bytes == null) return true; // no image → can't judge, allow
-    final W = captureSize.width.round();
-    final H = captureSize.height.round();
-    if (W <= 0 || H <= 0 || bytes.length < W * H) return true;
-    // JPEG: skip sharpness check (can't read raw pixels)
-    if (bytes.length > 3 &&
-        bytes[0] == 0xFF && bytes[1] == 0xD8 && bytes[2] == 0xFF) return true;
-
-    // Use barcode center row; fall back to frame center
-    final y = bbox != null
-        ? ((bbox.top + bbox.bottom) / 2).round().clamp(1, H - 2)
-        : H ~/ 2;
-    final x0 = bbox != null ? bbox.left.toInt().clamp(0, W - 1) : W ~/ 4;
-    final x1 = bbox != null ? bbox.right.toInt().clamp(x0 + 1, W) : 3 * W ~/ 4;
-    if (x1 - x0 < 10) return true;
-
-    int lo = 255, hi = 0;
-    for (int x = x0; x < x1; x++) {
-      final v = bytes[y * W + x];
-      if (v < lo) lo = v;
-      if (v > hi) hi = v;
-    }
-    final range = hi - lo;
-    if (range < 30) return true; // uniform row → no barcode here, can't judge
-
-    double maxGrad = 0;
-    for (int x = x0 + 1; x < x1; x++) {
-      final grad = (bytes[y * W + x] - bytes[y * W + x - 1]).abs().toDouble();
-      if (grad > maxGrad) maxGrad = grad;
-    }
-    // Sharp barcode: steepest edge ≥ 18% of total range per pixel.
-    return maxGrad / range >= 0.18;
   }
 
   void _continueScanning() {
@@ -221,6 +207,57 @@ class _ProductionScanScreenState extends State<ProductionScanScreen>
         _lastResult = null;
       });
     });
+  }
+
+  // Sharpness check on the barcode row. If blurry → show warning but still
+  // allow capture (the user decides, not the algorithm).
+  bool _isSharpEnough(Uint8List? bytes, Size captureSize, Rect? bbox) {
+    if (bytes == null) return true;
+    final W = captureSize.width.round();
+    final H = captureSize.height.round();
+    if (W <= 0 || H <= 0 || bytes.length < W * H) return true;
+    if (bytes.length > 3 &&
+        bytes[0] == 0xFF &&
+        bytes[1] == 0xD8 &&
+        bytes[2] == 0xFF) return true;
+
+    final y = bbox != null
+        ? ((bbox.top + bbox.bottom) / 2).round().clamp(1, H - 2)
+        : H ~/ 2;
+    final x0 =
+        bbox != null ? bbox.left.toInt().clamp(0, W - 1) : W ~/ 4;
+    final x1 =
+        bbox != null ? bbox.right.toInt().clamp(x0 + 1, W) : 3 * W ~/ 4;
+    if (x1 - x0 < 10) return true;
+
+    int lo = 255, hi = 0;
+    for (int x = x0; x < x1; x++) {
+      final v = bytes[y * W + x];
+      if (v < lo) lo = v;
+      if (v > hi) hi = v;
+    }
+    final range = hi - lo;
+    if (range < 30) return true;
+
+    double maxGrad = 0;
+    for (int x = x0 + 1; x < x1; x++) {
+      final grad =
+          (bytes[y * W + x] - bytes[y * W + x - 1]).abs().toDouble();
+      if (grad > maxGrad) maxGrad = grad;
+    }
+    return maxGrad / range >= 0.18;
+  }
+
+  bool _isValidDetection(BarcodeCapture capture, Barcode barcode) {
+    final bb = _cornersToRect(barcode.corners);
+    if (bb == null) return true;
+    final frameW = capture.size.width;
+    final frameH = capture.size.height;
+    if (frameW <= 0 || frameH <= 0) return true;
+    if (bb.width < frameW * 0.20) return false;
+    final centerY = bb.center.dy;
+    if (centerY < frameH * 0.20 || centerY > frameH * 0.80) return false;
+    return true;
   }
 
   Rect? _cornersToRect(List<Offset>? corners) {
@@ -255,17 +292,23 @@ class _ProductionScanScreenState extends State<ProductionScanScreen>
 
   @override
   Widget build(BuildContext context) {
+    final zoneColor = _barcodeInZone
+        ? (_isBlurry ? const Color(0xFFFFC107) : AppColors.ok)
+        : Colors.white.withOpacity(0.4);
+
     return Scaffold(
       backgroundColor: Colors.black,
       body: Stack(
         children: [
+          // Camera
           MobileScanner(
             controller: _scanner,
             onDetect: _onDetect,
-            overlayBuilder: (context, constraints) => const SizedBox.shrink(),
+            overlayBuilder: (context, constraints) =>
+                const SizedBox.shrink(),
           ),
 
-          // Scan zone — central 30% of height
+          // Scan zone overlay
           if (!_showResult)
             Positioned.fill(
               child: LayoutBuilder(builder: (_, constraints) {
@@ -273,16 +316,60 @@ class _ProductionScanScreenState extends State<ProductionScanScreen>
                 final zoneH = h * 0.30;
                 final zoneTop = (h - zoneH) / 2;
                 return Stack(children: [
-                  Positioned(top: 0, left: 0, right: 0, height: zoneTop,
-                    child: Container(color: Colors.black.withOpacity(0.55))),
-                  Positioned(bottom: 0, left: 0, right: 0, height: zoneTop,
-                    child: Container(color: Colors.black.withOpacity(0.55))),
-                  Positioned(top: zoneTop, left: 16, right: 16, height: zoneH,
-                    child: const DecoratedBox(
+                  Positioned(
+                      top: 0, left: 0, right: 0, height: zoneTop,
+                      child: Container(color: Colors.black.withOpacity(0.55))),
+                  Positioned(
+                      bottom: 0, left: 0, right: 0, height: zoneTop,
+                      child: Container(color: Colors.black.withOpacity(0.55))),
+                  Positioned(
+                    top: zoneTop, left: 16, right: 16, height: zoneH,
+                    child: AnimatedContainer(
+                      duration: const Duration(milliseconds: 200),
                       decoration: BoxDecoration(
-                        border: Border.fromBorderSide(
-                          BorderSide(color: Color(0xFFFFC107), width: 1.5)),
-                        borderRadius: BorderRadius.all(Radius.circular(8)),
+                        border: Border.all(color: zoneColor, width: 2),
+                        borderRadius:
+                            const BorderRadius.all(Radius.circular(8)),
+                      ),
+                    ),
+                  ),
+                  // Zone status label
+                  Positioned(
+                    top: zoneTop - 28,
+                    left: 0, right: 0,
+                    child: Center(
+                      child: AnimatedSwitcher(
+                        duration: const Duration(milliseconds: 200),
+                        child: _barcodeInZone
+                            ? Container(
+                                key: const ValueKey('detected'),
+                                padding: const EdgeInsets.symmetric(
+                                    horizontal: 12, vertical: 4),
+                                decoration: BoxDecoration(
+                                  color: _isBlurry
+                                      ? const Color(0xFFFFC107).withOpacity(0.15)
+                                      : AppColors.ok.withOpacity(0.15),
+                                  borderRadius: BorderRadius.circular(12),
+                                  border: Border.all(
+                                      color: _isBlurry
+                                          ? const Color(0xFFFFC107)
+                                              .withOpacity(0.6)
+                                          : AppColors.ok.withOpacity(0.6)),
+                                ),
+                                child: Text(
+                                  _isBlurry
+                                      ? '⚠ Imagen borrosa · Acerque el teléfono'
+                                      : '● Código detectado · Pulse capturar',
+                                  style: TextStyle(
+                                    color: _isBlurry
+                                        ? const Color(0xFFFFC107)
+                                        : AppColors.ok,
+                                    fontSize: 11,
+                                    fontWeight: FontWeight.w600,
+                                  ),
+                                ),
+                              )
+                            : const SizedBox.shrink(key: ValueKey('empty')),
                       ),
                     ),
                   ),
@@ -293,36 +380,47 @@ class _ProductionScanScreenState extends State<ProductionScanScreen>
           // Top bar
           SafeArea(
             child: Padding(
-              padding: const EdgeInsets.symmetric(horizontal: 16, vertical: 8),
+              padding:
+                  const EdgeInsets.symmetric(horizontal: 16, vertical: 8),
               child: Row(
                 children: [
-                  _camBtn(Icons.arrow_back_rounded, () => context.pop()),
+                  _camBtn(
+                      Icons.arrow_back_rounded, () => context.pop()),
                   const SizedBox(width: 12),
                   Container(
-                    padding: const EdgeInsets.symmetric(horizontal: 12, vertical: 6),
+                    padding: const EdgeInsets.symmetric(
+                        horizontal: 12, vertical: 6),
                     decoration: BoxDecoration(
                       color: Colors.black54,
                       borderRadius: BorderRadius.circular(20),
-                      border: Border.all(color: AppColors.ok.withOpacity(0.4)),
+                      border: Border.all(
+                          color: AppColors.ok.withOpacity(0.4)),
                     ),
                     child: Row(
                       mainAxisSize: MainAxisSize.min,
                       children: [
                         Container(
                           width: 6, height: 6,
-                          decoration: const BoxDecoration(color: AppColors.ok, shape: BoxShape.circle),
+                          decoration: const BoxDecoration(
+                              color: AppColors.ok,
+                              shape: BoxShape.circle),
                         ),
                         const SizedBox(width: 6),
-                        const Text('PRODUCCIÓN', style: TextStyle(
-                          fontSize: 11, fontWeight: FontWeight.w700,
-                          color: AppColors.ok, letterSpacing: 1.2,
-                        )),
+                        const Text('PRODUCCIÓN',
+                            style: TextStyle(
+                              fontSize: 11,
+                              fontWeight: FontWeight.w700,
+                              color: AppColors.ok,
+                              letterSpacing: 1.2,
+                            )),
                       ],
                     ),
                   ),
                   const Spacer(),
                   _camBtn(
-                    _torchOn ? Icons.flash_on_rounded : Icons.flash_off_rounded,
+                    _torchOn
+                        ? Icons.flash_on_rounded
+                        : Icons.flash_off_rounded,
                     () {
                       _scanner.toggleTorch();
                       setState(() => _torchOn = !_torchOn);
@@ -342,52 +440,97 @@ class _ProductionScanScreenState extends State<ProductionScanScreen>
                   child: Column(
                     mainAxisSize: MainAxisSize.min,
                     children: [
-                      CircularProgressIndicator(color: AppColors.accent, strokeWidth: 2),
+                      CircularProgressIndicator(
+                          color: AppColors.accent, strokeWidth: 2),
                       SizedBox(height: 12),
-                      Text('Analizando...', style: TextStyle(
-                        color: AppColors.textPrimary, fontSize: 14, fontWeight: FontWeight.w600,
-                      )),
+                      Text('Analizando...',
+                          style: TextStyle(
+                            color: AppColors.textPrimary,
+                            fontSize: 14,
+                            fontWeight: FontWeight.w600,
+                          )),
                     ],
                   ),
                 ),
               ),
             ),
 
-          // Hint / blur warning
+          // Capture button
           if (!_showResult && !_isAnalyzing)
             Positioned(
-              bottom: 60,
-              left: 24, right: 24,
-              child: Center(
-                child: _lastWasBlurry
-                    ? Container(
-                        padding: const EdgeInsets.symmetric(horizontal: 16, vertical: 8),
+              bottom: 40,
+              left: 0, right: 0,
+              child: Column(
+                children: [
+                  // Hint
+                  Text(
+                    _barcodeInZone
+                        ? ''
+                        : 'Apunta al código · Pulsa capturar',
+                    style: TextStyle(
+                      color: Colors.white.withOpacity(0.45),
+                      fontSize: 12,
+                    ),
+                  ),
+                  const SizedBox(height: 16),
+                  // Shutter button
+                  GestureDetector(
+                    onTap: _barcodeInZone ? _onCapturePressed : null,
+                    child: ScaleTransition(
+                      scale: _barcodeInZone
+                          ? _pulseAnim
+                          : const AlwaysStoppedAnimation(1.0),
+                      child: AnimatedContainer(
+                        duration: const Duration(milliseconds: 200),
+                        width: 72, height: 72,
                         decoration: BoxDecoration(
-                          color: const Color(0xFFFFC107).withOpacity(0.12),
-                          borderRadius: BorderRadius.circular(20),
-                          border: Border.all(color: const Color(0xFFFFC107).withOpacity(0.6)),
+                          shape: BoxShape.circle,
+                          color: _barcodeInZone
+                              ? (_isBlurry
+                                  ? const Color(0xFFFFC107)
+                                  : AppColors.ok)
+                              : Colors.white.withOpacity(0.15),
+                          border: Border.all(
+                              color: _barcodeInZone
+                                  ? Colors.white
+                                  : Colors.white.withOpacity(0.3),
+                              width: 3),
+                          boxShadow: _barcodeInZone
+                              ? [
+                                  BoxShadow(
+                                    color: (_isBlurry
+                                            ? const Color(0xFFFFC107)
+                                            : AppColors.ok)
+                                        .withOpacity(0.5),
+                                    blurRadius: 20,
+                                    spreadRadius: 4,
+                                  )
+                                ]
+                              : [],
                         ),
-                        child: const Row(
-                          mainAxisSize: MainAxisSize.min,
-                          children: [
-                            Icon(Icons.center_focus_weak_rounded,
-                                color: Color(0xFFFFC107), size: 14),
-                            SizedBox(width: 6),
-                            Text('Imagen borrosa · Acerque el teléfono',
-                                style: TextStyle(
-                                  color: Color(0xFFFFC107), fontSize: 12,
-                                  fontWeight: FontWeight.w600,
-                                )),
-                          ],
-                        ),
-                      )
-                    : Text(
-                        'Apunta al código · Detección automática',
-                        style: TextStyle(
-                          color: Colors.white.withOpacity(0.5),
-                          fontSize: 12, letterSpacing: 0.5,
+                        child: Icon(
+                          Icons.camera_alt_rounded,
+                          color: _barcodeInZone
+                              ? Colors.black
+                              : Colors.white.withOpacity(0.3),
+                          size: 30,
                         ),
                       ),
+                    ),
+                  ),
+                  const SizedBox(height: 8),
+                  Text(
+                    'CAPTURAR',
+                    style: TextStyle(
+                      color: _barcodeInZone
+                          ? Colors.white
+                          : Colors.white.withOpacity(0.25),
+                      fontSize: 10,
+                      fontWeight: FontWeight.w700,
+                      letterSpacing: 2,
+                    ),
+                  ),
+                ],
               ),
             ),
 
@@ -398,11 +541,13 @@ class _ProductionScanScreenState extends State<ProductionScanScreen>
                 scale: _resultScale,
                 child: _ResultOverlay(
                   verification: _lastResult!,
-                  isOk: _lastResult!.overallGrade.numeric >= _minGrade.numeric,
+                  isOk: _lastResult!.overallGrade.numeric >=
+                      _minGrade.numeric,
                   onContinue: _continueScanning,
                   onDetail: () {
                     _continueScanning();
-                    context.push('/technical/result', extra: _lastResult);
+                    context.push('/technical/result',
+                        extra: _lastResult);
                   },
                 ),
               ),
@@ -420,13 +565,16 @@ class _ProductionScanScreenState extends State<ProductionScanScreen>
         decoration: BoxDecoration(
           color: Colors.black54,
           borderRadius: BorderRadius.circular(10),
-          border: Border.all(color: Colors.white.withOpacity(0.15)),
+          border:
+              Border.all(color: Colors.white.withOpacity(0.15)),
         ),
         child: Icon(icon, color: Colors.white, size: 20),
       ),
     );
   }
 }
+
+// ─── Result overlay ───────────────────────────────────────────────────────────
 
 class _ResultOverlay extends StatelessWidget {
   final BarcodeVerification verification;
@@ -459,8 +607,7 @@ class _ResultOverlay extends StatelessWidget {
     final params = verification.parameters;
     final sorted = params.allValues.toList()
       ..sort((a, b) => a.grade.numeric.compareTo(b.grade.numeric));
-    final worst = sorted.first;
-    return _rootCauseFor(params, worst);
+    return _rootCauseFor(params, sorted.first);
   }
 
   String _paramLabel(ISOParameters p, GradeValue v) {
@@ -473,28 +620,34 @@ class _ResultOverlay extends StatelessWidget {
       return 'Defectos de impresión (DEF)';
     }
     if (identical(v, p.decodability)) return 'No decodificable';
-    if (p.minimumReflectance != null && identical(v, p.minimumReflectance)) return 'Reflectancia mínima (MR)';
-    if (p.edgeContrast != null && identical(v, p.edgeContrast)) return 'Bordes difusos (EC)';
+    if (p.minimumReflectance != null &&
+        identical(v, p.minimumReflectance)) return 'Reflectancia mínima (MR)';
+    if (p.edgeContrast != null && identical(v, p.edgeContrast))
+      return 'Bordes difusos (EC)';
     if (p.quietZones != null && identical(v, p.quietZones)) {
       final basis = v.estimationBasis ?? '';
       return basis.contains('Contaminación')
           ? 'Manchón en zona silenciosa (QZ)'
           : 'Margen insuficiente (QZ)';
     }
-    if (p.fixedPatternDamage != null && identical(v, p.fixedPatternDamage)) return 'Daño en patrón fijo';
-    if (p.gridNonuniformity != null && identical(v, p.gridNonuniformity)) return 'No-uniformidad de rejilla';
-    if (p.axialNonuniformity != null && identical(v, p.axialNonuniformity)) return 'No-uniformidad axial';
-    if (p.unusedErrorCorrection != null && identical(v, p.unusedErrorCorrection)) return 'Corrección de error baja';
-    if (p.printGrowth != null && identical(v, p.printGrowth)) return 'Crecimiento de impresión';
+    if (p.fixedPatternDamage != null &&
+        identical(v, p.fixedPatternDamage)) return 'Daño en patrón fijo';
+    if (p.gridNonuniformity != null &&
+        identical(v, p.gridNonuniformity)) return 'No-uniformidad de rejilla';
+    if (p.axialNonuniformity != null &&
+        identical(v, p.axialNonuniformity)) return 'No-uniformidad axial';
+    if (p.unusedErrorCorrection != null &&
+        identical(v, p.unusedErrorCorrection)) return 'Corrección de error baja';
+    if (p.printGrowth != null && identical(v, p.printGrowth))
+      return 'Crecimiento de impresión';
     return 'Calidad insuficiente';
   }
 
   String _rootCauseFor(ISOParameters p, GradeValue v) {
-    if (identical(v, p.symbolContrast)) {
+    if (identical(v, p.symbolContrast))
       return v.grade == ISOGrade.F
           ? 'Ribbon agotado o cabezal sin tinta'
           : 'Aumentar energía del cabezal';
-    }
     if (identical(v, p.defects)) {
       final basis = v.estimationBasis ?? '';
       if (basis.contains('void')) return 'Cabezal obstruido — limpiar urgente';
@@ -507,18 +660,14 @@ class _ResultOverlay extends StatelessWidget {
           ? 'Manchón de tinta — revisar ribbon y presión'
           : 'Ajustar márgenes en el diseño de etiqueta';
     }
-    if (p.edgeContrast != null && identical(v, p.edgeContrast)) {
+    if (p.edgeContrast != null && identical(v, p.edgeContrast))
       return 'Ribbon desgastado o velocidad de impresión alta';
-    }
-    if (identical(v, p.modulation)) {
+    if (identical(v, p.modulation))
       return 'Calibrar presión uniforme del cabezal';
-    }
-    if (p.minimumReflectance != null && identical(v, p.minimumReflectance)) {
-      return 'Papel muy oscuro o contaminado';
-    }
-    if (p.printGrowth != null && identical(v, p.printGrowth)) {
+    if (p.minimumReflectance != null &&
+        identical(v, p.minimumReflectance)) return 'Papel muy oscuro o contaminado';
+    if (p.printGrowth != null && identical(v, p.printGrowth))
       return 'Reducir energía o temperatura del cabezal';
-    }
     return '';
   }
 
@@ -528,7 +677,6 @@ class _ResultOverlay extends StatelessWidget {
     final grade = verification.overallGrade;
     final color = ok ? AppColors.ok : AppColors.nok;
     final bg = ok ? AppColors.okBg : AppColors.nokBg;
-    final borderColor = color.withOpacity(0.35);
 
     return Container(
       color: Colors.black87,
@@ -544,7 +692,8 @@ class _ResultOverlay extends StatelessWidget {
                 decoration: BoxDecoration(
                   color: bg,
                   borderRadius: BorderRadius.circular(20),
-                  border: Border.all(color: borderColor, width: 2),
+                  border:
+                      Border.all(color: color.withOpacity(0.35), width: 2),
                 ),
                 child: Column(
                   children: [
@@ -553,41 +702,52 @@ class _ResultOverlay extends StatelessWidget {
                       decoration: BoxDecoration(
                         color: color,
                         shape: BoxShape.circle,
-                        boxShadow: [BoxShadow(color: color.withOpacity(0.4), blurRadius: 20, spreadRadius: 4)],
+                        boxShadow: [
+                          BoxShadow(
+                              color: color.withOpacity(0.4),
+                              blurRadius: 20,
+                              spreadRadius: 4)
+                        ],
                       ),
                       child: Center(
                         child: Text(
                           ok ? '✓' : '✗',
                           style: TextStyle(
-                            fontSize: 44, color: ok ? Colors.black : Colors.white,
+                            fontSize: 44,
+                            color: ok ? Colors.black : Colors.white,
                             fontWeight: FontWeight.w900,
                           ),
                         ),
                       ),
                     ),
                     const SizedBox(height: 20),
-                    Text(
-                      grade.letter,
-                      style: TextStyle(
-                        fontSize: 72, fontWeight: FontWeight.w900,
-                        fontFamily: 'JetBrainsMono', color: color, height: 1,
-                      ),
-                    ),
+                    Text(grade.letter,
+                        style: TextStyle(
+                          fontSize: 72,
+                          fontWeight: FontWeight.w900,
+                          fontFamily: 'JetBrainsMono',
+                          color: color,
+                          height: 1,
+                        )),
                     const SizedBox(height: 8),
                     Text(
                       ok ? 'OK — APROBADO' : 'NO OK — RECHAZADO',
                       style: TextStyle(
-                        fontSize: 20, fontWeight: FontWeight.w800,
-                        color: color, letterSpacing: 2,
+                        fontSize: 20,
+                        fontWeight: FontWeight.w800,
+                        color: color,
+                        letterSpacing: 2,
                       ),
                     ),
                     const SizedBox(height: 16),
                     Container(
-                      padding: const EdgeInsets.symmetric(horizontal: 16, vertical: 10),
+                      padding: const EdgeInsets.symmetric(
+                          horizontal: 16, vertical: 10),
                       decoration: BoxDecoration(
                         color: Colors.black26,
                         borderRadius: BorderRadius.circular(8),
-                        border: Border.all(color: color.withOpacity(0.2)),
+                        border: Border.all(
+                            color: color.withOpacity(0.2)),
                       ),
                       child: Column(
                         children: [
@@ -595,7 +755,9 @@ class _ResultOverlay extends StatelessWidget {
                             _mainReason,
                             textAlign: TextAlign.center,
                             style: const TextStyle(
-                              fontSize: 13, color: AppColors.textSecondary, height: 1.4,
+                              fontSize: 13,
+                              color: AppColors.textSecondary,
+                              height: 1.4,
                             ),
                           ),
                           if (_rootCause.isNotEmpty) ...[
@@ -604,14 +766,18 @@ class _ResultOverlay extends StatelessWidget {
                               mainAxisAlignment: MainAxisAlignment.center,
                               children: [
                                 const Icon(Icons.build_rounded,
-                                    size: 11, color: AppColors.textMuted),
+                                    size: 11,
+                                    color: AppColors.textMuted),
                                 const SizedBox(width: 4),
-                                Text(
-                                  _rootCause,
-                                  textAlign: TextAlign.center,
-                                  style: const TextStyle(
-                                    fontSize: 11, color: AppColors.textMuted,
-                                    fontStyle: FontStyle.italic,
+                                Flexible(
+                                  child: Text(
+                                    _rootCause,
+                                    textAlign: TextAlign.center,
+                                    style: const TextStyle(
+                                      fontSize: 11,
+                                      color: AppColors.textMuted,
+                                      fontStyle: FontStyle.italic,
+                                    ),
                                   ),
                                 ),
                               ],
@@ -623,14 +789,13 @@ class _ResultOverlay extends StatelessWidget {
                     const SizedBox(height: 8),
                     Text(
                       '${verification.symbology.displayName} · ${verification.standard}',
-                      style: const TextStyle(fontSize: 11, color: AppColors.textMuted),
+                      style: const TextStyle(
+                          fontSize: 11, color: AppColors.textMuted),
                     ),
                   ],
                 ),
               ),
-
               const SizedBox(height: 20),
-
               Row(
                 children: [
                   Expanded(
@@ -647,7 +812,8 @@ class _ResultOverlay extends StatelessWidget {
                           child: Text(
                             '▶  Continuar',
                             style: TextStyle(
-                              fontSize: 17, fontWeight: FontWeight.w800,
+                              fontSize: 17,
+                              fontWeight: FontWeight.w800,
                               color: ok ? Colors.black : Colors.white,
                             ),
                           ),
@@ -667,7 +833,8 @@ class _ResultOverlay extends StatelessWidget {
                           border: Border.all(color: AppColors.border),
                         ),
                         child: const Center(
-                          child: Text('🔬', style: TextStyle(fontSize: 24)),
+                          child: Text('🔬',
+                              style: TextStyle(fontSize: 24)),
                         ),
                       ),
                     ),
