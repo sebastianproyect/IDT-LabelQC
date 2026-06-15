@@ -1,6 +1,7 @@
 import 'package:flutter/material.dart';
 import 'package:go_router/go_router.dart';
 import '../../../core/theme/app_theme.dart';
+import '../../../core/constants/app_version.dart';
 
 class HomeScreen extends StatelessWidget {
   const HomeScreen({super.key});
@@ -103,9 +104,18 @@ class _Header extends StatelessWidget {
             const Text('LabelQC Pro', style: TextStyle(
               fontSize: 18, fontWeight: FontWeight.w800, color: AppColors.textPrimary,
             )),
-            Text('Verificación ISO · v1.0', style: TextStyle(
-              fontSize: 11, color: AppColors.textSecondary, letterSpacing: 0.5,
-            )),
+            Row(
+              children: [
+                Text('v$kAppVersion · ', style: TextStyle(
+                  fontSize: 11, color: AppColors.accent,
+                  fontWeight: FontWeight.w700, letterSpacing: 0.3,
+                  fontFamily: 'JetBrainsMono',
+                )),
+                Text(kBuildName, style: TextStyle(
+                  fontSize: 11, color: AppColors.textSecondary, letterSpacing: 0.3,
+                )),
+              ],
+            ),
           ],
         ),
         const Spacer(),
