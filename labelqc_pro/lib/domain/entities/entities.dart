@@ -178,7 +178,24 @@ class ISOParameters extends Equatable {
         if (printGrowth != null) printGrowth!,
       ];
 
-  ISOGrade get overallGrade => ISOGrade.worst(allValues.map((v) => v.grade).toList());
+  /// Overall grade uses only parameters reliably measurable from a phone camera:
+  ///   · Symbol Contrast  — Michelson contrast from NV21 Y-plane, real value
+  ///   · Decodability     — binary (decoded or not), 100% reliable
+  ///   · Defects          — only when computed from actual image pixels
+  ///
+  /// EC, MOD, MR, QZ and geometric params are calculated and displayed for
+  /// diagnostics but do NOT determine pass/fail — camera estimates of those
+  /// parameters produce too many false rejects on visually clean barcodes.
+  ///
+  /// DEF is excluded when estimationBasis does NOT start with '~Cámara',
+  /// which means the analyzer fell back to a conservative guess (no image).
+  ISOGrade get overallGrade {
+    final votes = <GradeValue>[symbolContrast, decodability];
+    if (defects.estimationBasis?.startsWith('~Cámara') == true) {
+      votes.add(defects);
+    }
+    return ISOGrade.worst(votes.map((v) => v.grade).toList());
+  }
 
   Map<String, dynamic> toJson() => {
         'symbolContrast': symbolContrast.toJson(),
