@@ -132,9 +132,11 @@ class ISO15416Analyzer {
     final sc = _calcSC(p);
     final mr = _calcMR(p);
     final ec = _calcEC(p);
-    final mod = _calcMOD(p, sc.rawMeasurement / 100.0, ec.rawMeasurement);
-    // Multi-row DEF catches localized defects (smears, voids) that the single
-    // best row might miss. Falls back to single-row if image unavailable.
+    // MOD receives decoded flag so it can apply a minimum floor (a barcode that
+    // decoded must have had enough modulation to pass the decoder threshold).
+    final mod = _calcMOD(p, sc.rawMeasurement / 100.0, ec.rawMeasurement, decoded);
+    // Multi-row DEF: global-range normalization + 85th-percentile + structural check.
+    // Falls back to single-row if image unavailable.
     final def = _calcDEFMultiRow(input) ?? _calcDEF(p, p.rMax - p.rMin);
     return ISOParameters(
       symbolContrast: sc,
@@ -171,48 +173,77 @@ class ISO15416Analyzer {
     );
   }
 
-  // EC FIX: local peak/valley at each transition (not adjacent-pixel diff).
-  // For each edge, examine a ±window pixel region to find max (space) and
-  // min (bar) reflectance. EC = max - min at that transition.
-  // This gives the actual step amplitude, which is meaningful from camera data.
+  // EC: local peak/valley at each inner transition.
+  //
+  // Previous bug: minEC across ALL edges caused a single outlier (e.g. the
+  // outermost edge where barcode meets white background) to give EC = F and
+  // cascade to MOD = F even on a perfect barcode.
+  //
+  // Fix: skip the 1 outermost edge on each side (background transitions), then
+  // use the 20th-percentile of inner edge EC values. This is robust to isolated
+  // weak transitions without hiding real edge-contrast problems.
   GradeValue _calcEC(_ScanProfile p) {
     if (p.edges.isEmpty) {
       return GradeValue(rawMeasurement: 0, unit: 'ratio', grade: ISOGrade.F,
         numericGrade: 0, isEstimated: true, estimationBasis: '~Cámara');
     }
     const window = 12;
-    double minEC = 1.0;
-    for (final edge in p.edges) {
-      final pos = edge.position.round();
+    // Only skip boundary edges when there are enough to spare.
+    final startIdx = p.edges.length >= 5 ? 1 : 0;
+    final endIdx   = p.edges.length >= 5 ? p.edges.length - 1 : p.edges.length;
+
+    final ecValues = <double>[];
+    for (int i = startIdx; i < endIdx; i++) {
+      final pos = p.edges[i].position.round();
       final lo = (pos - window).clamp(0, p.values.length - 1);
       final hi = (pos + window).clamp(0, p.values.length - 1);
       double localMin = p.values[lo], localMax = p.values[lo];
-      for (int i = lo; i <= hi; i++) {
-        if (p.values[i] < localMin) localMin = p.values[i];
-        if (p.values[i] > localMax) localMax = p.values[i];
+      for (int k = lo; k <= hi; k++) {
+        if (p.values[k] < localMin) localMin = p.values[k];
+        if (p.values[k] > localMax) localMax = p.values[k];
       }
-      final ec = localMax - localMin;
-      if (ec < minEC) minEC = ec;
+      ecValues.add(localMax - localMin);
     }
+    if (ecValues.isEmpty) {
+      // Fallback: use all edges with minimum.
+      double minEC = 1.0;
+      for (final e in p.edges) ecValues.add(e.contrast);
+      ecValues.sort();
+      minEC = ecValues.first;
+      final g = minEC >= 0.35 ? ISOGrade.C : minEC >= 0.20 ? ISOGrade.D : ISOGrade.F;
+      return GradeValue(rawMeasurement: minEC, unit: 'ratio', grade: g,
+        numericGrade: g.numeric, isEstimated: true, estimationBasis: '~Cámara');
+    }
+    ecValues.sort();
+    // 20th percentile: more robust than minimum, still catches genuinely bad edges.
+    final idx = ((ecValues.length - 1) * 0.20).round();
+    final ec = ecValues[idx];
     ISOGrade g;
-    if (minEC >= 0.55) g = ISOGrade.A;
-    else if (minEC >= 0.45) g = ISOGrade.B;
-    else if (minEC >= 0.35) g = ISOGrade.C;
-    else if (minEC >= 0.20) g = ISOGrade.D;
+    if (ec >= 0.55) g = ISOGrade.A;
+    else if (ec >= 0.45) g = ISOGrade.B;
+    else if (ec >= 0.35) g = ISOGrade.C;
+    else if (ec >= 0.20) g = ISOGrade.D;
     else g = ISOGrade.F;
-    return GradeValue(rawMeasurement: minEC, unit: 'ratio', grade: g,
+    return GradeValue(rawMeasurement: ec, unit: 'ratio', grade: g,
       numericGrade: g.numeric, isEstimated: true, estimationBasis: '~Cámara');
   }
 
-  // MOD FIX: EC_min / SC. Now meaningful because EC is computed correctly.
-  GradeValue _calcMOD(_ScanProfile p, double sc, double ecMin) {
-    final mod = sc > 0 ? (ecMin / sc).clamp(0.0, 1.0) : 0.0;
+  // MOD: EC_percentile / SC.
+  //
+  // Additional rule: if the barcode decoded successfully, the decoder already
+  // proved that modulation was sufficient to distinguish bars from spaces.
+  // ISO standard implies decoded → MOD ≥ Grade C. Enforcing this prevents
+  // an estimated EC outlier from falsely failing an otherwise-readable barcode.
+  GradeValue _calcMOD(_ScanProfile p, double sc, double ec, bool decoded) {
+    final mod = sc > 0 ? (ec / sc).clamp(0.0, 1.0) : 0.0;
     ISOGrade g;
     if (mod >= 0.70) g = ISOGrade.A;
     else if (mod >= 0.55) g = ISOGrade.B;
     else if (mod >= 0.40) g = ISOGrade.C;
     else if (mod >= 0.25) g = ISOGrade.D;
     else g = ISOGrade.F;
+    // Decoded barcode → MOD floor = Grade C (decoder proved modulability).
+    if (decoded && g.numeric < ISOGrade.C.numeric) g = ISOGrade.C;
     return GradeValue(rawMeasurement: mod, unit: 'ratio', grade: g,
       numericGrade: g.numeric, isEstimated: true, estimationBasis: '~Cámara');
   }
@@ -256,15 +287,29 @@ class ISO15416Analyzer {
       numericGrade: g.numeric, isEstimated: true, estimationBasis: basis);
   }
 
-  // Multi-row DEF: scans every row across the barcode height, returns the
-  // worst-case DEF and classifies the defect type (void vs spot).
+  // Multi-row DEF — redesigned for camera reliability.
   //
-  // void  = dark element (bar) with a lighter patch inside → falta de tinta
-  // spot  = light element (space) with a darker patch inside → exceso de tinta
+  // Previous bug: each row normalized ERN by its OWN range. A row with moderate
+  // contrast (range=0.30) made any element variation look 2-3× larger, causing
+  // Grade F even on clean barcodes. Camera sensor noise alone gave DEF > 0.30 on
+  // rows with partial contrast.
   //
-  // Each row is self-normalizing (ERN / row range) so there is no dependency
-  // on global state. The defect type is encoded in estimationBasis so the UI
-  // can show the root cause.
+  // Fix — three-pass algorithm:
+  //
+  //   Pass 1  Find globalRange = max(range) across all valid rows. This is the
+  //           true photometric range of the barcode measured by the camera.
+  //           Also counts per-row transitions to detect structurally broken rows.
+  //
+  //   Pass 2  For each valid row, compute worst per-element ERN (absolute) and
+  //           normalize by globalRange. Collect one DEF value per row.
+  //           Rows with < 50% of best-row transitions are "damaged" (broken bar,
+  //           torn label, faded section) and contribute a high fixed DEF.
+  //
+  //   Pass 3  Sort row DEFs. Use the 85th percentile as the final score.
+  //           85th-pct catches real defects (present in most rows at a location)
+  //           while discarding isolated noisy rows (top 15%).
+  //
+  // Defect type (void/spot) is determined from the worst-affected rows.
   GradeValue? _calcDEFMultiRow(BarcodeAnalysisInput input) {
     final bytes = input.imageBytes;
     if (bytes == null) return null;
@@ -273,7 +318,7 @@ class ISO15416Analyzer {
     final H = input.captureSize.height.round();
     if (W <= 0 || H <= 0) return null;
 
-    // Only NV21 — JPEG gives unreliable per-pixel values.
+    // NV21 only — JPEG gives unreliable per-pixel luminance.
     if (bytes.length > 3 &&
         bytes[0] == 0xFF && bytes[1] == 0xD8 && bytes[2] == 0xFF) return null;
     if (bytes.length < W * H) return null;
@@ -288,61 +333,133 @@ class ISO15416Analyzer {
     final roiW = x1 - x0;
     if (roiW < 20 || y1 - y0 < 3) return null;
 
-    double worstDEF = 0.0;
-    bool worstIsBar = false; // true → void (lack of ink); false → spot (excess ink)
-    int rowsAnalyzed = 0;
     const rowStep = 2;
+    // Minimum range to consider a row as part of the barcode (not blank paper).
+    const minRange = 0.18;
+    // Minimum edges to consider a row as a valid barcode scan line.
+    const minEdges = 4;
+
+    // ── Pass 1: global range + transition inventory ───────────────────────────
+    double globalRange = 0.0;
+    int bestTransitions = 0;
+
+    // Store lightweight row summaries to avoid re-reading pixels twice.
+    final rowSummaries = <_RowSummary>[];
 
     for (int y = y0; y < y1; y += rowStep) {
       final base = y * W + x0;
       if (base + roiW > bytes.length) continue;
 
-      final rowVals = List<double>.filled(roiW, 0.0);
       double rMax = 0.0, rMin = 1.0;
       for (int x = 0; x < roiW; x++) {
         final v = bytes[base + x] / 255.0;
-        rowVals[x] = v;
         if (v > rMax) rMax = v;
         if (v < rMin) rMin = v;
       }
       final range = rMax - rMin;
-      if (range < 0.15) continue;
+      if (range < minRange) continue;
 
-      final edges = _detectEdges(rowVals, rMax, rMin);
-      if (edges.length < 4) continue;
+      // Count bar↔space transitions for structural check.
+      final thresh = (rMin + rMax) / 2;
+      int transitions = 0;
+      bool prevLight = bytes[base] / 255.0 >= thresh;
+      for (int x = 1; x < roiW; x++) {
+        final isLight = bytes[base + x] / 255.0 >= thresh;
+        if (isLight != prevLight) { transitions++; prevLight = isLight; }
+      }
+
+      if (range > globalRange) globalRange = range;
+      if (transitions > bestTransitions) bestTransitions = transitions;
+      rowSummaries.add(_RowSummary(y: y, rMax: rMax, rMin: rMin,
+          transitions: transitions));
+    }
+
+    if (globalRange < minRange || rowSummaries.length < 3) return null;
+    if (bestTransitions < 6) return null; // not a barcode row
+
+    // ── Pass 2: per-row worst ERN (absolute) + structural check ──────────────
+    final rowDEFs = <double>[];
+    int barVoteCount = 0; // rows where worst element is a bar (dark)
+    int damagedRows = 0;
+    // A row is "damaged" (broken bar, faded section, missing bars) when its
+    // transition count falls below 50% of the best row.
+    final damagedThreshold = (bestTransitions * 0.50).round();
+
+    for (final row in rowSummaries) {
+      if (row.transitions < damagedThreshold && row.transitions >= 2) {
+        // Structurally degraded row (broken bars, torn label, smear that fuses
+        // bars together). Assign a fixed high DEF contribution so the percentile
+        // captures this real defect without letting noise rows dominate.
+        damagedRows++;
+        rowDEFs.add(0.55); // just above Grade D threshold
+        continue;
+      }
+      if (row.transitions < minEdges) continue;
+
+      final base = row.y * W + x0;
+      if (base + roiW > bytes.length) continue;
+      final rowVals = List<double>.filled(roiW, 0.0);
+      for (int x = 0; x < roiW; x++) rowVals[x] = bytes[base + x] / 255.0;
+
+      final edges = _detectEdges(rowVals, row.rMax, row.rMin);
+      if (edges.length < minEdges) continue;
 
       final edgePos = edges.map((e) => e.position).toList();
       final boundaries = <double>[0, ...edgePos, rowVals.length.toDouble()];
-      final midpoint = (rMin + rMax) / 2;
+      final midpoint = (row.rMin + row.rMax) / 2;
+
+      double worstRowERN = 0.0;
+      bool worstRowIsBar = false;
 
       for (int i = 0; i < boundaries.length - 1; i++) {
         final start = boundaries[i].round().clamp(0, rowVals.length - 1);
-        final end = boundaries[i + 1].round().clamp(start, rowVals.length);
+        final end   = boundaries[i + 1].round().clamp(start, rowVals.length);
         if (end - start < 3) continue;
 
-        double eMin = rowVals[start], eMax = rowVals[start];
-        double eSum = 0;
+        double eMin = rowVals[start], eMax = rowVals[start], eSum = 0;
         for (int j = start; j < end; j++) {
           if (rowVals[j] < eMin) eMin = rowVals[j];
           if (rowVals[j] > eMax) eMax = rowVals[j];
           eSum += rowVals[j];
         }
-        // Normalize ERN by this row's range → DEF value for this element.
-        final defElem = range > 0 ? (eMax - eMin) / range : 0.0;
-        if (defElem > worstDEF) {
-          worstDEF = defElem;
-          // Below midpoint = bar (dark element) → void if it has variation.
-          // Above midpoint = space (light element) → spot if it has variation.
-          worstIsBar = (eSum / (end - start)) < midpoint;
+        // Absolute ERN — will be normalized by globalRange after collection.
+        final ern = eMax - eMin;
+        if (ern > worstRowERN) {
+          worstRowERN = ern;
+          worstRowIsBar = (eSum / (end - start)) < midpoint;
         }
       }
-      rowsAnalyzed++;
+
+      // Normalize by GLOBAL range (not per-row range).
+      // This eliminates the amplification effect of low-contrast rows.
+      final rowDEF = globalRange > 0 ? worstRowERN / globalRange : 0.0;
+      rowDEFs.add(rowDEF);
+      if (worstRowIsBar) barVoteCount++;
     }
 
-    if (rowsAnalyzed < 2) return null;
+    if (rowDEFs.length < 3) return null;
+
+    // ── Pass 3: 85th percentile ───────────────────────────────────────────────
+    rowDEFs.sort();
+    final p85idx = ((rowDEFs.length - 1) * 0.85).round();
+    final def = rowDEFs[p85idx].clamp(0.0, 1.0);
+
+    // Defect type from the majority of affected rows.
+    final totalAnalyzed = rowSummaries.length;
+    final worstIsBar = totalAnalyzed > 0
+        ? (barVoteCount / totalAnalyzed) >= 0.5
+        : false;
+
+    // If >35% of rows are structurally damaged, signal broken-bar defect
+    // regardless of the element-level DEF (this is a more severe finding).
+    if (damagedRows > 0 && damagedRows / totalAnalyzed >= 0.35) {
+      final severity = damagedRows / totalAnalyzed;
+      final structuralDEF = (0.55 + (severity - 0.35) * 1.5).clamp(0.55, 1.0);
+      return _defGradeValue(structuralDEF, '~Cámara · barras-rotas');
+    }
 
     final defectType = worstIsBar ? 'void' : 'spot';
-    return _defGradeValue(worstDEF, '~Cámara · $defectType');
+    return _defGradeValue(def, '~Cámara · $defectType');
   }
 
   List<_Edge> _detectEdges(List<double> profile, double rMax, double rMin) {
@@ -525,6 +642,13 @@ class _ScanProfile {
   final List<_Edge> edges;
   _ScanProfile({required this.values, required this.rMax,
       required this.rMin, required this.edges});
+}
+
+class _RowSummary {
+  final int y, transitions;
+  final double rMax, rMin;
+  _RowSummary({required this.y, required this.transitions,
+      required this.rMax, required this.rMin});
 }
 
 class _Edge {

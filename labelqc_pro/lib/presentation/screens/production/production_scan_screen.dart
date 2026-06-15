@@ -31,6 +31,7 @@ class _ProductionScanScreenState extends State<ProductionScanScreen>
 
   bool _torchOn = false;
   bool _isAnalyzing = false;
+  bool _isStabilizing = false; // 400ms pause after capture button press
   bool _showResult = false;
   bool _isBlurry = false;
   BarcodeVerification? _lastResult;
@@ -121,17 +122,33 @@ class _ProductionScanScreenState extends State<ProductionScanScreen>
     }
   }
 
-  // Triggered by the capture button. Analyzes the last stored frame.
+  // Triggered by the capture button. Waits 400ms so auto-focus can settle and
+  // onDetect refreshes _pendingCapture with the sharpest available frame.
   Future<void> _onCapturePressed() async {
+    if (_pendingCapture == null || _isAnalyzing || _showResult || _isStabilizing) return;
+
+    setState(() { _isStabilizing = true; });
+    // During this 400ms the scanner keeps running and _pendingCapture updates
+    // to the most recent detected frame — ensures we analyse a fresh sharp image.
+    await Future.delayed(const Duration(milliseconds: 400));
+    if (!mounted) return;
+
     final capture = _pendingCapture;
-    if (capture == null || _isAnalyzing || _showResult) return;
+    if (capture == null) {
+      setState(() { _isStabilizing = false; });
+      return;
+    }
 
     // Snapshot immediately to avoid race with next onDetect call.
     final barcode = capture.barcodes.firstOrNull;
-    if (barcode == null || barcode.rawValue == null) return;
+    if (barcode == null || barcode.rawValue == null) {
+      setState(() { _isStabilizing = false; });
+      return;
+    }
 
     _clearZoneTimer?.cancel();
     setState(() {
+      _isStabilizing = false;
       _isAnalyzing = true;
       _barcodeInZone = false;
       _pendingCapture = null;
@@ -462,22 +479,45 @@ class _ProductionScanScreenState extends State<ProductionScanScreen>
               left: 0, right: 0,
               child: Column(
                 children: [
-                  // Hint
-                  Text(
-                    _barcodeInZone
-                        ? ''
-                        : 'Apunta al código · Pulsa capturar',
-                    style: TextStyle(
-                      color: Colors.white.withOpacity(0.45),
-                      fontSize: 12,
-                    ),
+                  // Hint / stabilizing label
+                  AnimatedSwitcher(
+                    duration: const Duration(milliseconds: 200),
+                    child: _isStabilizing
+                        ? Container(
+                            key: const ValueKey('stabilizing'),
+                            padding: const EdgeInsets.symmetric(
+                                horizontal: 14, vertical: 5),
+                            decoration: BoxDecoration(
+                              color: AppColors.accent.withOpacity(0.15),
+                              borderRadius: BorderRadius.circular(12),
+                              border: Border.all(color: AppColors.accent.withOpacity(0.5)),
+                            ),
+                            child: const Text(
+                              '⟳  Enfocando...',
+                              style: TextStyle(
+                                color: AppColors.accent,
+                                fontSize: 12,
+                                fontWeight: FontWeight.w700,
+                              ),
+                            ),
+                          )
+                        : Text(
+                            key: const ValueKey('hint'),
+                            _barcodeInZone ? '' : 'Apunta al código · Pulsa capturar',
+                            style: TextStyle(
+                              color: Colors.white.withOpacity(0.45),
+                              fontSize: 12,
+                            ),
+                          ),
                   ),
                   const SizedBox(height: 16),
                   // Shutter button
                   GestureDetector(
-                    onTap: _barcodeInZone ? _onCapturePressed : null,
+                    onTap: (_barcodeInZone && !_isStabilizing)
+                        ? _onCapturePressed
+                        : null,
                     child: ScaleTransition(
-                      scale: _barcodeInZone
+                      scale: (_barcodeInZone && !_isStabilizing)
                           ? _pulseAnim
                           : const AlwaysStoppedAnimation(1.0),
                       child: AnimatedContainer(
@@ -485,22 +525,26 @@ class _ProductionScanScreenState extends State<ProductionScanScreen>
                         width: 72, height: 72,
                         decoration: BoxDecoration(
                           shape: BoxShape.circle,
-                          color: _barcodeInZone
-                              ? (_isBlurry
-                                  ? const Color(0xFFFFC107)
-                                  : AppColors.ok)
-                              : Colors.white.withOpacity(0.15),
+                          color: _isStabilizing
+                              ? AppColors.accent
+                              : _barcodeInZone
+                                  ? (_isBlurry
+                                      ? const Color(0xFFFFC107)
+                                      : AppColors.ok)
+                                  : Colors.white.withOpacity(0.15),
                           border: Border.all(
-                              color: _barcodeInZone
+                              color: (_barcodeInZone || _isStabilizing)
                                   ? Colors.white
                                   : Colors.white.withOpacity(0.3),
                               width: 3),
-                          boxShadow: _barcodeInZone
+                          boxShadow: (_barcodeInZone || _isStabilizing)
                               ? [
                                   BoxShadow(
-                                    color: (_isBlurry
-                                            ? const Color(0xFFFFC107)
-                                            : AppColors.ok)
+                                    color: (_isStabilizing
+                                            ? AppColors.accent
+                                            : _isBlurry
+                                                ? const Color(0xFFFFC107)
+                                                : AppColors.ok)
                                         .withOpacity(0.5),
                                     blurRadius: 20,
                                     spreadRadius: 4,
@@ -508,21 +552,29 @@ class _ProductionScanScreenState extends State<ProductionScanScreen>
                                 ]
                               : [],
                         ),
-                        child: Icon(
-                          Icons.camera_alt_rounded,
-                          color: _barcodeInZone
-                              ? Colors.black
-                              : Colors.white.withOpacity(0.3),
-                          size: 30,
-                        ),
+                        child: _isStabilizing
+                            ? const SizedBox(
+                                width: 28, height: 28,
+                                child: CircularProgressIndicator(
+                                  color: Colors.black,
+                                  strokeWidth: 2.5,
+                                ),
+                              )
+                            : Icon(
+                                Icons.camera_alt_rounded,
+                                color: _barcodeInZone
+                                    ? Colors.black
+                                    : Colors.white.withOpacity(0.3),
+                                size: 30,
+                              ),
                       ),
                     ),
                   ),
                   const SizedBox(height: 8),
                   Text(
-                    'CAPTURAR',
+                    _isStabilizing ? 'ENFOCANDO' : 'CAPTURAR',
                     style: TextStyle(
-                      color: _barcodeInZone
+                      color: (_barcodeInZone || _isStabilizing)
                           ? Colors.white
                           : Colors.white.withOpacity(0.25),
                       fontSize: 10,
@@ -615,6 +667,7 @@ class _ResultOverlay extends StatelessWidget {
     if (identical(v, p.modulation)) return 'Modulación insuficiente (MOD)';
     if (identical(v, p.defects)) {
       final basis = v.estimationBasis ?? '';
+      if (basis.contains('barras-rotas')) return 'Barras rotas / faltantes (DEF)';
       if (basis.contains('void')) return 'Void en barras (DEF)';
       if (basis.contains('spot')) return 'Mancha en espacios (DEF)';
       return 'Defectos de impresión (DEF)';
@@ -650,6 +703,7 @@ class _ResultOverlay extends StatelessWidget {
           : 'Aumentar energía del cabezal';
     if (identical(v, p.defects)) {
       final basis = v.estimationBasis ?? '';
+      if (basis.contains('barras-rotas')) return 'Sección de código dañada — revisar etiqueta';
       if (basis.contains('void')) return 'Cabezal obstruido — limpiar urgente';
       if (basis.contains('spot')) return 'Temperatura alta o cabezal sucio';
       return 'Revisar cabezal de impresión';
