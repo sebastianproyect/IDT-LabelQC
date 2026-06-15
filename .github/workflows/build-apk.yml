@@ -32,12 +32,14 @@ jobs:
         working-directory: labelqc_pro
         run: flutter pub get
 
-      - name: Build APK
+      - name: Build split APKs by architecture
         working-directory: labelqc_pro
-        run: flutter build apk --release
+        run: flutter build apk --release --split-per-abi
 
-      - name: Rename APK
-        run: mv labelqc_pro/build/app/outputs/flutter-apk/app-release.apk IDT-LabelQC.apk
+      - name: Rename APKs
+        run: |
+          mv labelqc_pro/build/app/outputs/flutter-apk/app-arm64-v8a-release.apk   IDT-LabelQC-arm64.apk
+          mv labelqc_pro/build/app/outputs/flutter-apk/app-armeabi-v7a-release.apk IDT-LabelQC-arm32.apk
 
       - name: Create Release
         uses: softprops/action-gh-release@v2
@@ -45,12 +47,20 @@ jobs:
           tag_name: v1.0-build-${{ github.run_number }}
           name: "IDT LabelQC v1.0 (build ${{ github.run_number }})"
           body: |
-            ## Descarga e instala la app
+            ## Descarga el APK correcto para tu teléfono
 
-            1. Descarga el archivo **IDT-LabelQC.apk**
-            2. En tu Android: Ajustes → Seguridad → Fuentes desconocidas → Activar
-            3. Abre el APK y sigue los pasos
+            | Archivo | Para quién |
+            |---------|-----------|
+            | **IDT-LabelQC-arm64.apk** ⭐ | **Teléfonos modernos (2016+)** — descarga ESTE |
+            | IDT-LabelQC-arm32.apk | Teléfonos muy antiguos (antes de 2016) |
+
+            ### Pasos de instalación
+            1. Descarga **IDT-LabelQC-arm64.apk** (si no funciona prueba arm32)
+            2. En tu Android: **Ajustes → Seguridad → Fuentes desconocidas → Activar**
+            3. Abre el APK descargado e instala
             4. Usuario: `admin` | Contraseña: `admin123`
-          files: IDT-LabelQC.apk
+          files: |
+            IDT-LabelQC-arm64.apk
+            IDT-LabelQC-arm32.apk
           draft: false
           prerelease: false
