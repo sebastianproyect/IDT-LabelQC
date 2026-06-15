@@ -1,3 +1,4 @@
+import 'dart:typed_data';
 import 'package:flutter/material.dart';
 import 'package:flutter/services.dart';
 import 'package:mobile_scanner/mobile_scanner.dart' hide BarcodeType;
@@ -29,6 +30,7 @@ class _ProductionScanScreenState extends State<ProductionScanScreen>
   bool _torchOn = false;
   bool _isAnalyzing = false;
   bool _showResult = false;
+  bool _lastWasBlurry = false;
   BarcodeVerification? _lastResult;
   ISOGrade _minGrade = ISOGrade.C;
 
@@ -94,6 +96,16 @@ class _ProductionScanScreenState extends State<ProductionScanScreen>
     // Smart filter: skip barcodes too small or outside the scan zone
     if (!_isValidDetection(capture, barcode)) return;
 
+    // Sharpness check: if the image is blurry the photometric analysis is
+    // unreliable. Show a warning and skip this frame instead of giving a
+    // misleading grade.
+    final bbox = _cornersToRect(barcode.corners);
+    if (!_isSharpEnough(capture.image, capture.size, bbox)) {
+      if (mounted) setState(() => _lastWasBlurry = true);
+      return;
+    }
+    if (mounted) setState(() => _lastWasBlurry = false);
+
     setState(() => _isAnalyzing = true);
 
     try {
@@ -147,6 +159,7 @@ class _ProductionScanScreenState extends State<ProductionScanScreen>
         _lastResult = verification;
         _isAnalyzing = false;
         _showResult = true;
+        _lastWasBlurry = false;
       });
       _resultAnim.forward(from: 0);
 
@@ -161,6 +174,44 @@ class _ProductionScanScreenState extends State<ProductionScanScreen>
     } else {
       HapticFeedback.heavyImpact();
     }
+  }
+
+  // Returns false when the NV21 image is too blurry for reliable photometric
+  // analysis. Measures the steepness of the sharpest edge in the barcode row:
+  // a focused barcode has edges that jump ≥ 18% of the total range in one pixel.
+  bool _isSharpEnough(Uint8List? bytes, Size captureSize, Rect? bbox) {
+    if (bytes == null) return true; // no image → can't judge, allow
+    final W = captureSize.width.round();
+    final H = captureSize.height.round();
+    if (W <= 0 || H <= 0 || bytes.length < W * H) return true;
+    // JPEG: skip sharpness check (can't read raw pixels)
+    if (bytes.length > 3 &&
+        bytes[0] == 0xFF && bytes[1] == 0xD8 && bytes[2] == 0xFF) return true;
+
+    // Use barcode center row; fall back to frame center
+    final y = bbox != null
+        ? ((bbox.top + bbox.bottom) / 2).round().clamp(1, H - 2)
+        : H ~/ 2;
+    final x0 = bbox != null ? bbox.left.toInt().clamp(0, W - 1) : W ~/ 4;
+    final x1 = bbox != null ? bbox.right.toInt().clamp(x0 + 1, W) : 3 * W ~/ 4;
+    if (x1 - x0 < 10) return true;
+
+    int lo = 255, hi = 0;
+    for (int x = x0; x < x1; x++) {
+      final v = bytes[y * W + x];
+      if (v < lo) lo = v;
+      if (v > hi) hi = v;
+    }
+    final range = hi - lo;
+    if (range < 30) return true; // uniform row → no barcode here, can't judge
+
+    double maxGrad = 0;
+    for (int x = x0 + 1; x < x1; x++) {
+      final grad = (bytes[y * W + x] - bytes[y * W + x - 1]).abs().toDouble();
+      if (grad > maxGrad) maxGrad = grad;
+    }
+    // Sharp barcode: steepest edge ≥ 18% of total range per pixel.
+    return maxGrad / range >= 0.18;
   }
 
   void _continueScanning() {
@@ -302,19 +353,41 @@ class _ProductionScanScreenState extends State<ProductionScanScreen>
               ),
             ),
 
-          // Hint
+          // Hint / blur warning
           if (!_showResult && !_isAnalyzing)
             Positioned(
               bottom: 60,
-              left: 0, right: 0,
+              left: 24, right: 24,
               child: Center(
-                child: Text(
-                  'Apunta al código · Detección automática',
-                  style: TextStyle(
-                    color: Colors.white.withOpacity(0.5),
-                    fontSize: 12, letterSpacing: 0.5,
-                  ),
-                ),
+                child: _lastWasBlurry
+                    ? Container(
+                        padding: const EdgeInsets.symmetric(horizontal: 16, vertical: 8),
+                        decoration: BoxDecoration(
+                          color: const Color(0xFFFFC107).withOpacity(0.12),
+                          borderRadius: BorderRadius.circular(20),
+                          border: Border.all(color: const Color(0xFFFFC107).withOpacity(0.6)),
+                        ),
+                        child: const Row(
+                          mainAxisSize: MainAxisSize.min,
+                          children: [
+                            Icon(Icons.center_focus_weak_rounded,
+                                color: Color(0xFFFFC107), size: 14),
+                            SizedBox(width: 6),
+                            Text('Imagen borrosa · Acerque el teléfono',
+                                style: TextStyle(
+                                  color: Color(0xFFFFC107), fontSize: 12,
+                                  fontWeight: FontWeight.w600,
+                                )),
+                          ],
+                        ),
+                      )
+                    : Text(
+                        'Apunta al código · Detección automática',
+                        style: TextStyle(
+                          color: Colors.white.withOpacity(0.5),
+                          fontSize: 12, letterSpacing: 0.5,
+                        ),
+                      ),
               ),
             ),
 
@@ -374,7 +447,6 @@ class _ResultOverlay extends StatelessWidget {
           ? verification.recommendations.first.title
           : '${verification.overallGrade.label} · ${verification.symbology.displayName}';
     }
-    // Find the worst parameter and report it as the root cause of rejection
     final params = verification.parameters;
     final sorted = params.allValues.toList()
       ..sort((a, b) => a.grade.numeric.compareTo(b.grade.numeric));
@@ -382,20 +454,72 @@ class _ResultOverlay extends StatelessWidget {
     return '${_paramLabel(params, worst)} · Grado ${worst.grade.letter}';
   }
 
+  String get _rootCause {
+    if (isOk) return '';
+    final params = verification.parameters;
+    final sorted = params.allValues.toList()
+      ..sort((a, b) => a.grade.numeric.compareTo(b.grade.numeric));
+    final worst = sorted.first;
+    return _rootCauseFor(params, worst);
+  }
+
   String _paramLabel(ISOParameters p, GradeValue v) {
     if (identical(v, p.symbolContrast)) return 'Contraste bajo (SC)';
     if (identical(v, p.modulation)) return 'Modulación insuficiente (MOD)';
-    if (identical(v, p.defects)) return 'Defectos de impresión (DEF)';
+    if (identical(v, p.defects)) {
+      final basis = v.estimationBasis ?? '';
+      if (basis.contains('void')) return 'Void en barras (DEF)';
+      if (basis.contains('spot')) return 'Mancha en espacios (DEF)';
+      return 'Defectos de impresión (DEF)';
+    }
     if (identical(v, p.decodability)) return 'No decodificable';
     if (p.minimumReflectance != null && identical(v, p.minimumReflectance)) return 'Reflectancia mínima (MR)';
-    if (p.edgeContrast != null && identical(v, p.edgeContrast)) return 'Contraste de borde (EC)';
-    if (p.quietZones != null && identical(v, p.quietZones)) return 'Zonas silenciosas insuficientes';
+    if (p.edgeContrast != null && identical(v, p.edgeContrast)) return 'Bordes difusos (EC)';
+    if (p.quietZones != null && identical(v, p.quietZones)) {
+      final basis = v.estimationBasis ?? '';
+      return basis.contains('Contaminación')
+          ? 'Manchón en zona silenciosa (QZ)'
+          : 'Margen insuficiente (QZ)';
+    }
     if (p.fixedPatternDamage != null && identical(v, p.fixedPatternDamage)) return 'Daño en patrón fijo';
     if (p.gridNonuniformity != null && identical(v, p.gridNonuniformity)) return 'No-uniformidad de rejilla';
     if (p.axialNonuniformity != null && identical(v, p.axialNonuniformity)) return 'No-uniformidad axial';
     if (p.unusedErrorCorrection != null && identical(v, p.unusedErrorCorrection)) return 'Corrección de error baja';
     if (p.printGrowth != null && identical(v, p.printGrowth)) return 'Crecimiento de impresión';
     return 'Calidad insuficiente';
+  }
+
+  String _rootCauseFor(ISOParameters p, GradeValue v) {
+    if (identical(v, p.symbolContrast)) {
+      return v.grade == ISOGrade.F
+          ? 'Ribbon agotado o cabezal sin tinta'
+          : 'Aumentar energía del cabezal';
+    }
+    if (identical(v, p.defects)) {
+      final basis = v.estimationBasis ?? '';
+      if (basis.contains('void')) return 'Cabezal obstruido — limpiar urgente';
+      if (basis.contains('spot')) return 'Temperatura alta o cabezal sucio';
+      return 'Revisar cabezal de impresión';
+    }
+    if (p.quietZones != null && identical(v, p.quietZones)) {
+      final basis = v.estimationBasis ?? '';
+      return basis.contains('Contaminación')
+          ? 'Manchón de tinta — revisar ribbon y presión'
+          : 'Ajustar márgenes en el diseño de etiqueta';
+    }
+    if (p.edgeContrast != null && identical(v, p.edgeContrast)) {
+      return 'Ribbon desgastado o velocidad de impresión alta';
+    }
+    if (identical(v, p.modulation)) {
+      return 'Calibrar presión uniforme del cabezal';
+    }
+    if (p.minimumReflectance != null && identical(v, p.minimumReflectance)) {
+      return 'Papel muy oscuro o contaminado';
+    }
+    if (p.printGrowth != null && identical(v, p.printGrowth)) {
+      return 'Reducir energía o temperatura del cabezal';
+    }
+    return '';
   }
 
   @override
@@ -465,12 +589,35 @@ class _ResultOverlay extends StatelessWidget {
                         borderRadius: BorderRadius.circular(8),
                         border: Border.all(color: color.withOpacity(0.2)),
                       ),
-                      child: Text(
-                        _mainReason,
-                        textAlign: TextAlign.center,
-                        style: const TextStyle(
-                          fontSize: 13, color: AppColors.textSecondary, height: 1.4,
-                        ),
+                      child: Column(
+                        children: [
+                          Text(
+                            _mainReason,
+                            textAlign: TextAlign.center,
+                            style: const TextStyle(
+                              fontSize: 13, color: AppColors.textSecondary, height: 1.4,
+                            ),
+                          ),
+                          if (_rootCause.isNotEmpty) ...[
+                            const SizedBox(height: 6),
+                            Row(
+                              mainAxisAlignment: MainAxisAlignment.center,
+                              children: [
+                                const Icon(Icons.build_rounded,
+                                    size: 11, color: AppColors.textMuted),
+                                const SizedBox(width: 4),
+                                Text(
+                                  _rootCause,
+                                  textAlign: TextAlign.center,
+                                  style: const TextStyle(
+                                    fontSize: 11, color: AppColors.textMuted,
+                                    fontStyle: FontStyle.italic,
+                                  ),
+                                ),
+                              ],
+                            ),
+                          ],
+                        ],
                       ),
                     ),
                     const SizedBox(height: 8),

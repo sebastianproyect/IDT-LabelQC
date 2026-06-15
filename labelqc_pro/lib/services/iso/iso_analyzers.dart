@@ -256,8 +256,15 @@ class ISO15416Analyzer {
       numericGrade: g.numeric, isEstimated: true, estimationBasis: basis);
   }
 
-  // Multi-row DEF: scans every row across the barcode height and returns the
-  // worst-case DEF. Catches smears and voids that the single best row misses.
+  // Multi-row DEF: scans every row across the barcode height, returns the
+  // worst-case DEF and classifies the defect type (void vs spot).
+  //
+  // void  = dark element (bar) with a lighter patch inside → falta de tinta
+  // spot  = light element (space) with a darker patch inside → exceso de tinta
+  //
+  // Each row is self-normalizing (ERN / row range) so there is no dependency
+  // on global state. The defect type is encoded in estimationBasis so the UI
+  // can show the root cause.
   GradeValue? _calcDEFMultiRow(BarcodeAnalysisInput input) {
     final bytes = input.imageBytes;
     if (bytes == null) return null;
@@ -274,7 +281,6 @@ class ISO15416Analyzer {
     final bb = input.boundingBox;
     if (bb == null || bb.width < 20) return null;
 
-    // ROI: tight to barcode bounding box (no padding) so we measure the symbol itself.
     final x0 = bb.left.toInt().clamp(0, W - 1);
     final x1 = bb.right.toInt().clamp(x0 + 1, W);
     final y0 = bb.top.toInt().clamp(0, H - 1);
@@ -283,6 +289,7 @@ class ISO15416Analyzer {
     if (roiW < 20 || y1 - y0 < 3) return null;
 
     double worstDEF = 0.0;
+    bool worstIsBar = false; // true → void (lack of ink); false → spot (excess ink)
     int rowsAnalyzed = 0;
     const rowStep = 2;
 
@@ -299,18 +306,43 @@ class ISO15416Analyzer {
         if (v < rMin) rMin = v;
       }
       final range = rMax - rMin;
-      if (range < 0.15) continue; // not enough contrast — skip (e.g. background rows)
+      if (range < 0.15) continue;
 
       final edges = _detectEdges(rowVals, rMax, rMin);
       if (edges.length < 4) continue;
 
-      final def = _defValueFromProfile(rowVals, edges, range);
-      if (def > worstDEF) worstDEF = def;
+      final edgePos = edges.map((e) => e.position).toList();
+      final boundaries = <double>[0, ...edgePos, rowVals.length.toDouble()];
+      final midpoint = (rMin + rMax) / 2;
+
+      for (int i = 0; i < boundaries.length - 1; i++) {
+        final start = boundaries[i].round().clamp(0, rowVals.length - 1);
+        final end = boundaries[i + 1].round().clamp(start, rowVals.length);
+        if (end - start < 3) continue;
+
+        double eMin = rowVals[start], eMax = rowVals[start];
+        double eSum = 0;
+        for (int j = start; j < end; j++) {
+          if (rowVals[j] < eMin) eMin = rowVals[j];
+          if (rowVals[j] > eMax) eMax = rowVals[j];
+          eSum += rowVals[j];
+        }
+        // Normalize ERN by this row's range → DEF value for this element.
+        final defElem = range > 0 ? (eMax - eMin) / range : 0.0;
+        if (defElem > worstDEF) {
+          worstDEF = defElem;
+          // Below midpoint = bar (dark element) → void if it has variation.
+          // Above midpoint = space (light element) → spot if it has variation.
+          worstIsBar = (eSum / (end - start)) < midpoint;
+        }
+      }
       rowsAnalyzed++;
     }
 
     if (rowsAnalyzed < 2) return null;
-    return _defGradeValue(worstDEF, '~Cámara (multi-fila)');
+
+    final defectType = worstIsBar ? 'void' : 'spot';
+    return _defGradeValue(worstDEF, '~Cámara · $defectType');
   }
 
   List<_Edge> _detectEdges(List<double> profile, double rMax, double rMin) {
