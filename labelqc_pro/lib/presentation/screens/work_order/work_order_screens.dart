@@ -1,5 +1,6 @@
 import 'dart:convert';
 import 'dart:typed_data';
+import 'dart:ui';
 import 'package:flutter/material.dart';
 import 'package:flutter/services.dart';
 import 'package:go_router/go_router.dart';
@@ -10,6 +11,7 @@ import '../../widgets/common/widgets.dart';
 import '../../../domain/entities/entities.dart';
 import '../../../data/datasources/local/database/app_database.dart';
 import '../../../services/iso/iso_analyzers.dart';
+import '../../../services/iso/nv21_utils.dart';
 import '../../../services/spc/spc_and_recommendations.dart';
 import '../../../injection.dart';
 import '../../../services/pdf/of_pdf_generator.dart';
@@ -354,7 +356,8 @@ class WorkOrderScanScreen extends StatefulWidget {
   State<WorkOrderScanScreen> createState() => _WorkOrderScanScreenState();
 }
 
-class _WorkOrderScanScreenState extends State<WorkOrderScanScreen> {
+class _WorkOrderScanScreenState extends State<WorkOrderScanScreen>
+    with NV21Utils {
   final _db = getIt<AppDatabase>();
   final _analyzer1D = getIt<ISO15416Analyzer>();
   final _analyzer2D = getIt<ISO15415Analyzer>();
@@ -437,14 +440,45 @@ class _WorkOrderScanScreenState extends State<WorkOrderScanScreen> {
     setState(() => _isAnalyzing = true);
     try {
       final type = _mapFormat(barcode.format);
-      final input = BarcodeAnalysisInput(
-        rawValue: barcode.rawValue,
-        symbology: type,
-        corners: barcode.corners,
-        boundingBox: _cornersToRect(barcode.corners),
-        captureSize: capture.size,
-        imageBytes: capture.image,
-      );
+
+      // NV21 orientation crop — same fix as production mode.
+      final rawImage = capture.image;
+      final displayBB = _cornersToRect(barcode.corners);
+      final BarcodeAnalysisInput input;
+
+      if (rawImage != null && !nv21IsJpeg(rawImage)) {
+        final layout = nv21ResolveLayout(rawImage, capture.size, displayBB);
+        final crop = nv21CropBarcode(rawImage, layout.$1, layout.$2, layout.$3);
+        if (crop != null) {
+          input = BarcodeAnalysisInput(
+            rawValue: barcode.rawValue,
+            symbology: type,
+            corners: barcode.corners,
+            boundingBox: Rect.fromLTWH(0, 0, crop.$2.width, crop.$2.height),
+            captureSize: crop.$2,
+            imageBytes: crop.$1,
+          );
+        } else {
+          input = BarcodeAnalysisInput(
+            rawValue: barcode.rawValue,
+            symbology: type,
+            corners: barcode.corners,
+            boundingBox: displayBB,
+            captureSize: capture.size,
+            imageBytes: rawImage,
+          );
+        }
+      } else {
+        input = BarcodeAnalysisInput(
+          rawValue: barcode.rawValue,
+          symbology: type,
+          corners: barcode.corners,
+          boundingBox: displayBB,
+          captureSize: capture.size,
+          imageBytes: rawImage,
+        );
+      }
+
       final params = type.is2D
           ? _analyzer2D.analyze(input)
           : _analyzer1D.analyze(input);

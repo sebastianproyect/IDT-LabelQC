@@ -425,6 +425,14 @@ class ISO15416Analyzer {
       double worstRowERN = 0.0;
       bool worstRowIsBar = false;
 
+      // Contamination check: dark ink in bright (space) elements.
+      // Marker/rotulador ink creates dark pixels within space elements that
+      // should be bright. ERN alone underdetects diagonal marks because a
+      // diagonal line crosses each element at only one point.
+      // Threshold 0.38: below this inside a space element = contamination.
+      const contamThreshold = 0.38;
+      double worstContamSeverity = 0.0;
+
       for (int i = 0; i < boundaries.length - 1; i++) {
         final start = boundaries[i].round().clamp(0, rowVals.length - 1);
         final end   = boundaries[i + 1].round().clamp(start, rowVals.length);
@@ -436,15 +444,28 @@ class ISO15416Analyzer {
           if (rowVals[j] > eMax) eMax = rowVals[j];
           eSum += rowVals[j];
         }
-        final ern = eMax - eMin; // absolute ERN
+        final ern = eMax - eMin;
+        final avg = eSum / (end - start);
         if (ern > worstRowERN) {
           worstRowERN = ern;
-          worstRowIsBar = (eSum / (end - start)) < midpoint;
+          worstRowIsBar = avg < midpoint;
+        }
+        // Contamination: space elements (avg > midpoint) with dark pixels
+        if (avg > midpoint && eMin < contamThreshold) {
+          final severity = (contamThreshold - eMin) / contamThreshold;
+          if (severity > worstContamSeverity) worstContamSeverity = severity;
         }
       }
 
-      // Normalize by GLOBAL range, not this row's range.
-      final rowDEF = globalRange > 0 ? worstRowERN / globalRange : 0.0;
+      // Contamination DEF contribution (severity × 0.90):
+      //   severity 0.30 (min≈0.27) → 0.27 DEF (Grade C/D)
+      //   severity 0.60 (min≈0.15) → 0.54 DEF (Grade F)
+      //   severity 1.00 (min=0.00) → 0.90 DEF (Grade F)
+      final contamDEF = worstContamSeverity * 0.90;
+
+      // Take the worst of ERN-based DEF and contamination DEF.
+      final rowDEF =
+          max(globalRange > 0 ? worstRowERN / globalRange : 0.0, contamDEF);
       normalRowDEFs.add(rowDEF);
       if (worstRowIsBar) barVoteCount++;
     }

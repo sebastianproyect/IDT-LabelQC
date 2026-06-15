@@ -1,8 +1,11 @@
+import 'dart:typed_data';
+import 'dart:ui';
 import 'package:flutter/material.dart';
 import 'package:flutter/services.dart';
 import 'package:mobile_scanner/mobile_scanner.dart' hide BarcodeType;
 import 'package:go_router/go_router.dart';
 import '../../../core/theme/app_theme.dart';
+import '../../../services/iso/nv21_utils.dart';
 import '../../widgets/common/widgets.dart';
 import '../../../domain/entities/entities.dart';
 import '../../../services/iso/iso_analyzers.dart';
@@ -20,7 +23,8 @@ class TechnicalScanScreen extends StatefulWidget {
   State<TechnicalScanScreen> createState() => _TechnicalScanScreenState();
 }
 
-class _TechnicalScanScreenState extends State<TechnicalScanScreen> {
+class _TechnicalScanScreenState extends State<TechnicalScanScreen>
+    with NV21Utils {
   final MobileScannerController _scanner = MobileScannerController(
     detectionSpeed: DetectionSpeed.noDuplicates,
     facing: CameraFacing.back,
@@ -51,14 +55,44 @@ class _TechnicalScanScreenState extends State<TechnicalScanScreen> {
     try {
       final barcode0 = barcode!;
       final type = _mapFormat(barcode0.format);
-      final input = BarcodeAnalysisInput(
-        rawValue: barcode0.rawValue,
-        symbology: type,
-        corners: barcode0.corners,
-        boundingBox: _cornersToRect(barcode0.corners),
-        captureSize: capture.size,
-        imageBytes: capture.image,
-      );
+
+      // NV21 orientation crop — same fix as production mode.
+      final rawImage = capture.image;
+      final displayBB = _cornersToRect(barcode0.corners);
+      final BarcodeAnalysisInput input;
+
+      if (rawImage != null && !nv21IsJpeg(rawImage)) {
+        final layout = nv21ResolveLayout(rawImage, capture.size, displayBB);
+        final crop = nv21CropBarcode(rawImage, layout.$1, layout.$2, layout.$3);
+        if (crop != null) {
+          input = BarcodeAnalysisInput(
+            rawValue: barcode0.rawValue,
+            symbology: type,
+            corners: barcode0.corners,
+            boundingBox: Rect.fromLTWH(0, 0, crop.$2.width, crop.$2.height),
+            captureSize: crop.$2,
+            imageBytes: crop.$1,
+          );
+        } else {
+          input = BarcodeAnalysisInput(
+            rawValue: barcode0.rawValue,
+            symbology: type,
+            corners: barcode0.corners,
+            boundingBox: displayBB,
+            captureSize: capture.size,
+            imageBytes: rawImage,
+          );
+        }
+      } else {
+        input = BarcodeAnalysisInput(
+          rawValue: barcode0.rawValue,
+          symbology: type,
+          corners: barcode0.corners,
+          boundingBox: displayBB,
+          captureSize: capture.size,
+          imageBytes: rawImage,
+        );
+      }
 
       final params = type.is2D
           ? _analyzer2D.analyze(input)
