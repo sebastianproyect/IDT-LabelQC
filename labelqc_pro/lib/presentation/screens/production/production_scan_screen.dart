@@ -64,10 +64,35 @@ class _ProductionScanScreenState extends State<ProductionScanScreen>
     super.dispose();
   }
 
+  // Rejects detections that are too small or outside the scan zone.
+  // Prevents triggering on background barcodes, logos, or shelf labels nearby.
+  bool _isValidDetection(BarcodeCapture capture, Barcode barcode) {
+    final bb = _cornersToRect(barcode.corners);
+    if (bb == null) return true;
+
+    final frameW = capture.size.width;
+    final frameH = capture.size.height;
+    if (frameW <= 0 || frameH <= 0) return true;
+
+    // Barcode must occupy at least 20% of frame width.
+    // Background barcodes or accidental reads are typically much smaller.
+    if (bb.width < frameW * 0.20) return false;
+
+    // Barcode center must be within the central 60% of frame height.
+    // This matches the visual scan zone (30% height centered at 50%).
+    final centerY = bb.center.dy;
+    if (centerY < frameH * 0.20 || centerY > frameH * 0.80) return false;
+
+    return true;
+  }
+
   void _onDetect(BarcodeCapture capture) async {
     if (_isAnalyzing || _showResult) return;
     final barcode = capture.barcodes.firstOrNull;
     if (barcode == null || barcode.rawValue == null) return;
+
+    // Smart filter: skip barcodes too small or outside the scan zone
+    if (!_isValidDetection(capture, barcode)) return;
 
     setState(() => _isAnalyzing = true);
 
@@ -86,12 +111,12 @@ class _ProductionScanScreenState extends State<ProductionScanScreen>
           ? _analyzer2D.analyze(input)
           : _analyzer1D.analyze(input);
 
-      // Safety floor: a decoded barcode is at minimum Grade C.
-      // Phone cameras cannot give ISO-calibrated photometric measurements;
-      // decodability (the primary ISO parameter) is the reliable signal.
-      // If analysis gives F for a decoded code, it's a camera artifact, not a real defect.
+      // Safety floor only when the camera gave NO image bytes.
+      // With image bytes (NV21), the photometric analysis is real — trust it.
+      // Without image bytes we have no signal besides decodability, so a
+      // decoded code is conservatively floored at Grade C.
       final rawGrade = params.overallGrade;
-      final effectiveGrade = rawGrade.numeric < ISOGrade.C.numeric
+      final effectiveGrade = (input.imageBytes == null && rawGrade.numeric < ISOGrade.C.numeric)
           ? ISOGrade.C
           : rawGrade;
 
@@ -183,14 +208,13 @@ class _ProductionScanScreenState extends State<ProductionScanScreen>
       backgroundColor: Colors.black,
       body: Stack(
         children: [
-          // Camera
           MobileScanner(
             controller: _scanner,
             onDetect: _onDetect,
             overlayBuilder: (context, constraints) => const SizedBox.shrink(),
           ),
 
-          // Scan zone — limited central band (30% height) for better detection
+          // Scan zone — central 30% of height
           if (!_showResult)
             Positioned.fill(
               child: LayoutBuilder(builder: (_, constraints) {
@@ -278,7 +302,7 @@ class _ProductionScanScreenState extends State<ProductionScanScreen>
               ),
             ),
 
-          // Hint text
+          // Hint
           if (!_showResult && !_isAnalyzing)
             Positioned(
               bottom: 60,
@@ -344,6 +368,36 @@ class _ResultOverlay extends StatelessWidget {
     required this.onDetail,
   });
 
+  String get _mainReason {
+    if (isOk) {
+      return verification.recommendations.isNotEmpty
+          ? verification.recommendations.first.title
+          : '${verification.overallGrade.label} · ${verification.symbology.displayName}';
+    }
+    // Find the worst parameter and report it as the root cause of rejection
+    final params = verification.parameters;
+    final sorted = params.allValues.toList()
+      ..sort((a, b) => a.grade.numeric.compareTo(b.grade.numeric));
+    final worst = sorted.first;
+    return '${_paramLabel(params, worst)} · Grado ${worst.grade.letter}';
+  }
+
+  String _paramLabel(ISOParameters p, GradeValue v) {
+    if (identical(v, p.symbolContrast)) return 'Contraste bajo (SC)';
+    if (identical(v, p.modulation)) return 'Modulación insuficiente (MOD)';
+    if (identical(v, p.defects)) return 'Defectos de impresión (DEF)';
+    if (identical(v, p.decodability)) return 'No decodificable';
+    if (p.minimumReflectance != null && identical(v, p.minimumReflectance)) return 'Reflectancia mínima (MR)';
+    if (p.edgeContrast != null && identical(v, p.edgeContrast)) return 'Contraste de borde (EC)';
+    if (p.quietZones != null && identical(v, p.quietZones)) return 'Zonas silenciosas insuficientes';
+    if (p.fixedPatternDamage != null && identical(v, p.fixedPatternDamage)) return 'Daño en patrón fijo';
+    if (p.gridNonuniformity != null && identical(v, p.gridNonuniformity)) return 'No-uniformidad de rejilla';
+    if (p.axialNonuniformity != null && identical(v, p.axialNonuniformity)) return 'No-uniformidad axial';
+    if (p.unusedErrorCorrection != null && identical(v, p.unusedErrorCorrection)) return 'Corrección de error baja';
+    if (p.printGrowth != null && identical(v, p.printGrowth)) return 'Crecimiento de impresión';
+    return 'Calidad insuficiente';
+  }
+
   @override
   Widget build(BuildContext context) {
     final ok = isOk;
@@ -351,10 +405,6 @@ class _ResultOverlay extends StatelessWidget {
     final color = ok ? AppColors.ok : AppColors.nok;
     final bg = ok ? AppColors.okBg : AppColors.nokBg;
     final borderColor = color.withOpacity(0.35);
-
-    final mainReason = verification.recommendations.isNotEmpty
-        ? verification.recommendations.first.title
-        : (ok ? '${grade.label} · ${verification.symbology.displayName}' : 'Calidad insuficiente');
 
     return Container(
       color: Colors.black87,
@@ -364,7 +414,6 @@ class _ResultOverlay extends StatelessWidget {
           child: Column(
             mainAxisAlignment: MainAxisAlignment.center,
             children: [
-              // Result card
               Container(
                 width: double.infinity,
                 padding: const EdgeInsets.all(32),
@@ -417,7 +466,7 @@ class _ResultOverlay extends StatelessWidget {
                         border: Border.all(color: color.withOpacity(0.2)),
                       ),
                       child: Text(
-                        mainReason,
+                        _mainReason,
                         textAlign: TextAlign.center,
                         style: const TextStyle(
                           fontSize: 13, color: AppColors.textSecondary, height: 1.4,
@@ -435,7 +484,6 @@ class _ResultOverlay extends StatelessWidget {
 
               const SizedBox(height: 20),
 
-              // Action buttons
               Row(
                 children: [
                   Expanded(
