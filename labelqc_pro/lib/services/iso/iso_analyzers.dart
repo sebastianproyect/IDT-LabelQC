@@ -132,16 +132,30 @@ class ISO15416Analyzer {
     final sc = _calcSC(p);
     final mr = _calcMR(p);
     final ec = _calcEC(p);
-    // MOD receives decoded flag so it can apply a minimum floor (a barcode that
-    // decoded must have had enough modulation to pass the decoder threshold).
-    final mod = _calcMOD(p, sc.rawMeasurement / 100.0, ec.rawMeasurement, decoded);
-    // Multi-row DEF: global-range normalization + 85th-percentile + structural check.
+
+    // Visual-first grading principle:
+    // If the barcode decoded, the scanner proved that edge contrast was sufficient
+    // to distinguish every bar from every space. EC and MOD are camera estimates
+    // of optical properties that the decoder already verified empirically.
+    // → Cap estimated EC at Grade C minimum when decoded. This prevents camera
+    //   noise in edge transitions from falsely failing a visually clean barcode.
+    final safeEC = (decoded && ec.grade.numeric < ISOGrade.C.numeric)
+        ? GradeValue(
+            rawMeasurement: ec.rawMeasurement, unit: ec.unit,
+            grade: ISOGrade.C, numericGrade: ISOGrade.C.numeric,
+            isEstimated: true, estimationBasis: ec.estimationBasis)
+        : ec;
+
+    final mod = _calcMOD(p, sc.rawMeasurement / 100.0, safeEC.rawMeasurement, decoded);
+
+    // Multi-row DEF: global-range normalization + 80th-pct + structural check.
     // Falls back to single-row if image unavailable.
     final def = _calcDEFMultiRow(input) ?? _calcDEF(p, p.rMax - p.rMin);
+
     return ISOParameters(
       symbolContrast: sc,
       minimumReflectance: mr,
-      edgeContrast: ec,
+      edgeContrast: safeEC,
       modulation: mod,
       defects: def,
       decodability: _calcDecodability(decoded),
@@ -287,29 +301,29 @@ class ISO15416Analyzer {
       numericGrade: g.numeric, isEstimated: true, estimationBasis: basis);
   }
 
-  // Multi-row DEF — redesigned for camera reliability.
+  // Multi-row DEF — three-pass algorithm designed for camera-grade reliability.
   //
-  // Previous bug: each row normalized ERN by its OWN range. A row with moderate
-  // contrast (range=0.30) made any element variation look 2-3× larger, causing
-  // Grade F even on clean barcodes. Camera sensor noise alone gave DEF > 0.30 on
-  // rows with partial contrast.
+  // Design principles:
   //
-  // Fix — three-pass algorithm:
+  //   Pass 1  Inventory all BARCODE rows (≥8 transitions AND good contrast).
+  //           Filtering by ≥8 transitions is the critical step: it excludes
+  //           blank margins, digit-area rows, and label borders that would
+  //           otherwise be mistaken for "structurally damaged" barcode rows.
+  //           Track globalRange = max(range) for denominator normalization.
   //
-  //   Pass 1  Find globalRange = max(range) across all valid rows. This is the
-  //           true photometric range of the barcode measured by the camera.
-  //           Also counts per-row transitions to detect structurally broken rows.
+  //   Pass 2  For each barcode row, classify it:
+  //           - Normal   : transitions ≥ 50% of best row. Compute element ERN
+  //                        normalized by globalRange (not per-row range).
+  //           - Damaged  : transitions < 50% of best. This row has structural
+  //                        damage (ink smear fusing bars, torn section, heavy
+  //                        contamination). Count it; don't add to element DEFs.
   //
-  //   Pass 2  For each valid row, compute worst per-element ERN (absolute) and
-  //           normalize by globalRange. Collect one DEF value per row.
-  //           Rows with < 50% of best-row transitions are "damaged" (broken bar,
-  //           torn label, faded section) and contribute a high fixed DEF.
+  //   Pass 3  Element DEF = 80th-pct of normal row DEFs (ignores top 20% noise).
+  //           Structural DEF = function of damaged fraction (0%→0, 15%→C, 35%→F).
+  //           Final DEF = max(element, structural).
   //
-  //   Pass 3  Sort row DEFs. Use the 85th percentile as the final score.
-  //           85th-pct catches real defects (present in most rows at a location)
-  //           while discarding isolated noisy rows (top 15%).
-  //
-  // Defect type (void/spot) is determined from the worst-affected rows.
+  // This correctly gives A/B on clean barcodes and D/F on barcodes with ink
+  // smears, rotulador marks, torn sections, or fused bars.
   GradeValue? _calcDEFMultiRow(BarcodeAnalysisInput input) {
     final bytes = input.imageBytes;
     if (bytes == null) return null;
@@ -334,16 +348,14 @@ class ISO15416Analyzer {
     if (roiW < 20 || y1 - y0 < 3) return null;
 
     const rowStep = 2;
-    // Minimum range to consider a row as part of the barcode (not blank paper).
     const minRange = 0.18;
-    // Minimum edges to consider a row as a valid barcode scan line.
-    const minEdges = 4;
+    // ≥8 transitions = minimum to be classified as a barcode row.
+    // Margin/blank rows: 0-4 transitions. Digit rows: 4-7. Barcode rows: ≥8.
+    const minBarcodeTransitions = 8;
 
-    // ── Pass 1: global range + transition inventory ───────────────────────────
+    // ── Pass 1: inventory all barcode rows ────────────────────────────────────
     double globalRange = 0.0;
     int bestTransitions = 0;
-
-    // Store lightweight row summaries to avoid re-reading pixels twice.
     final rowSummaries = <_RowSummary>[];
 
     for (int y = y0; y < y1; y += rowStep) {
@@ -359,7 +371,6 @@ class ISO15416Analyzer {
       final range = rMax - rMin;
       if (range < minRange) continue;
 
-      // Count bar↔space transitions for structural check.
       final thresh = (rMin + rMax) / 2;
       int transitions = 0;
       bool prevLight = bytes[base] / 255.0 >= thresh;
@@ -368,6 +379,11 @@ class ISO15416Analyzer {
         if (isLight != prevLight) { transitions++; prevLight = isLight; }
       }
 
+      // KEY FILTER: only include rows that are clearly barcode rows.
+      // This prevents blank top/bottom margins and digit areas from being
+      // counted as "damaged rows" in Pass 2.
+      if (transitions < minBarcodeTransitions) continue;
+
       if (range > globalRange) globalRange = range;
       if (transitions > bestTransitions) bestTransitions = transitions;
       rowSummaries.add(_RowSummary(y: y, rMax: rMax, rMin: rMin,
@@ -375,26 +391,24 @@ class ISO15416Analyzer {
     }
 
     if (globalRange < minRange || rowSummaries.length < 3) return null;
-    if (bestTransitions < 6) return null; // not a barcode row
+    if (bestTransitions < minBarcodeTransitions) return null;
 
-    // ── Pass 2: per-row worst ERN (absolute) + structural check ──────────────
-    final rowDEFs = <double>[];
-    int barVoteCount = 0; // rows where worst element is a bar (dark)
+    // ── Pass 2: classify rows, compute element ERN for normal rows ────────────
+    // Damaged = valid barcode row but with fewer bar-space transitions than
+    // expected. The blue-marker case: ink fuses bars together → transitions drop.
+    final damagedThreshold = max(minBarcodeTransitions,
+        (bestTransitions * 0.50).round());
+
     int damagedRows = 0;
-    // A row is "damaged" (broken bar, faded section, missing bars) when its
-    // transition count falls below 50% of the best row.
-    final damagedThreshold = (bestTransitions * 0.50).round();
+    final normalRowDEFs = <double>[];
+    int barVoteCount = 0;
 
     for (final row in rowSummaries) {
-      if (row.transitions < damagedThreshold && row.transitions >= 2) {
-        // Structurally degraded row (broken bars, torn label, smear that fuses
-        // bars together). Assign a fixed high DEF contribution so the percentile
-        // captures this real defect without letting noise rows dominate.
+      if (row.transitions < damagedThreshold) {
+        // Structural damage: row has fewer bar-space crossings than a healthy row.
         damagedRows++;
-        rowDEFs.add(0.55); // just above Grade D threshold
-        continue;
+        continue; // don't contribute to element-level DEF calculation
       }
-      if (row.transitions < minEdges) continue;
 
       final base = row.y * W + x0;
       if (base + roiW > bytes.length) continue;
@@ -402,7 +416,7 @@ class ISO15416Analyzer {
       for (int x = 0; x < roiW; x++) rowVals[x] = bytes[base + x] / 255.0;
 
       final edges = _detectEdges(rowVals, row.rMax, row.rMin);
-      if (edges.length < minEdges) continue;
+      if (edges.length < 4) continue;
 
       final edgePos = edges.map((e) => e.position).toList();
       final boundaries = <double>[0, ...edgePos, rowVals.length.toDouble()];
@@ -422,44 +436,54 @@ class ISO15416Analyzer {
           if (rowVals[j] > eMax) eMax = rowVals[j];
           eSum += rowVals[j];
         }
-        // Absolute ERN — will be normalized by globalRange after collection.
-        final ern = eMax - eMin;
+        final ern = eMax - eMin; // absolute ERN
         if (ern > worstRowERN) {
           worstRowERN = ern;
           worstRowIsBar = (eSum / (end - start)) < midpoint;
         }
       }
 
-      // Normalize by GLOBAL range (not per-row range).
-      // This eliminates the amplification effect of low-contrast rows.
+      // Normalize by GLOBAL range, not this row's range.
       final rowDEF = globalRange > 0 ? worstRowERN / globalRange : 0.0;
-      rowDEFs.add(rowDEF);
+      normalRowDEFs.add(rowDEF);
       if (worstRowIsBar) barVoteCount++;
     }
 
-    if (rowDEFs.length < 3) return null;
+    if (normalRowDEFs.isEmpty && damagedRows == 0) return null;
 
-    // ── Pass 3: 85th percentile ───────────────────────────────────────────────
-    rowDEFs.sort();
-    final p85idx = ((rowDEFs.length - 1) * 0.85).round();
-    final def = rowDEFs[p85idx].clamp(0.0, 1.0);
-
-    // Defect type from the majority of affected rows.
-    final totalAnalyzed = rowSummaries.length;
-    final worstIsBar = totalAnalyzed > 0
-        ? (barVoteCount / totalAnalyzed) >= 0.5
-        : false;
-
-    // If >35% of rows are structurally damaged, signal broken-bar defect
-    // regardless of the element-level DEF (this is a more severe finding).
-    if (damagedRows > 0 && damagedRows / totalAnalyzed >= 0.35) {
-      final severity = damagedRows / totalAnalyzed;
-      final structuralDEF = (0.55 + (severity - 0.35) * 1.5).clamp(0.55, 1.0);
-      return _defGradeValue(structuralDEF, '~Cámara · barras-rotas');
+    // ── Pass 3: combine element DEF + structural penalty ──────────────────────
+    double elementDEF = 0.0;
+    if (normalRowDEFs.isNotEmpty) {
+      normalRowDEFs.sort();
+      final p80idx = ((normalRowDEFs.length - 1) * 0.80).round();
+      elementDEF = normalRowDEFs[p80idx].clamp(0.0, 1.0);
     }
 
-    final defectType = worstIsBar ? 'void' : 'spot';
-    return _defGradeValue(def, '~Cámara · $defectType');
+    final totalBarcodeRows = rowSummaries.length;
+    final damagedFraction =
+        totalBarcodeRows > 0 ? damagedRows / totalBarcodeRows : 0.0;
+    final structuralDEF = _structuralDEFFromFraction(damagedFraction);
+
+    final def = max(elementDEF, structuralDEF);
+
+    if (damagedFraction >= 0.15) {
+      return _defGradeValue(def, '~Cámara · barras-rotas');
+    }
+    final worstIsBar = normalRowDEFs.isNotEmpty
+        ? barVoteCount / normalRowDEFs.length >= 0.5
+        : false;
+    return _defGradeValue(def, '~Cámara · ${worstIsBar ? 'void' : 'spot'}');
+  }
+
+  // Converts fraction of structurally damaged rows to a DEF score.
+  // "Damaged row" = barcode row with < 50% of best-row transition count,
+  // meaning bars are fused, torn, or heavily contaminated.
+  double _structuralDEFFromFraction(double fraction) {
+    if (fraction >= 0.35) return 0.75; // Grade F
+    if (fraction >= 0.25) return 0.50; // Grade D
+    if (fraction >= 0.15) return 0.35; // Grade C
+    if (fraction >= 0.08) return 0.22; // Grade B boundary
+    return 0.0;                         // No structural penalty
   }
 
   List<_Edge> _detectEdges(List<double> profile, double rMax, double rMin) {
