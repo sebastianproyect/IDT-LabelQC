@@ -133,7 +133,9 @@ class ISO15416Analyzer {
     final mr = _calcMR(p);
     final ec = _calcEC(p);
     final mod = _calcMOD(p, sc.rawMeasurement / 100.0, ec.rawMeasurement);
-    final def = _calcDEF(p, p.rMax - p.rMin);
+    // Multi-row DEF catches localized defects (smears, voids) that the single
+    // best row might miss. Falls back to single-row if image unavailable.
+    final def = _calcDEFMultiRow(input) ?? _calcDEF(p, p.rMax - p.rMin);
     return ISOParameters(
       symbolContrast: sc,
       minimumReflectance: mr,
@@ -215,34 +217,35 @@ class ISO15416Analyzer {
       numericGrade: g.numeric, isEstimated: true, estimationBasis: '~Cámara');
   }
 
-  // DEF FIX: per-element non-uniformity — measures within each bar/space,
-  // NOT across transitions. For clean bars: elements are nearly uniform → A.
-  // For spotted/dirty bars: element has local lighter area → D or F.
+  // DEF: per-element non-uniformity on a single profile.
   GradeValue _calcDEF(_ScanProfile p, double range) {
-    final edgePos = p.edges.map((e) => e.position).toList();
-    if (edgePos.length < 2) {
-      return GradeValue(rawMeasurement: 0.05, unit: 'ratio', grade: ISOGrade.A,
-        numericGrade: 4.0, isEstimated: true, estimationBasis: '~Cámara');
-    }
+    final def = _defValueFromProfile(p.values, p.edges, range);
+    return _defGradeValue(def, '~Cámara');
+  }
 
-    final boundaries = <double>[0, ...edgePos, p.values.length.toDouble()];
+  // Numeric DEF from a profile + its edges. Shared by single-row and multi-row.
+  double _defValueFromProfile(List<double> values, List<_Edge> edges, double range) {
+    final edgePos = edges.map((e) => e.position).toList();
+    if (edgePos.length < 2) return 0.05;
+
+    final boundaries = <double>[0, ...edgePos, values.length.toDouble()];
     double maxERN = 0.0;
-
     for (int i = 0; i < boundaries.length - 1; i++) {
-      final start = boundaries[i].round().clamp(0, p.values.length - 1);
-      final end = boundaries[i + 1].round().clamp(start, p.values.length);
-      if (end - start < 3) continue; // element too narrow to measure
-
-      double eMin = p.values[start], eMax = p.values[start];
+      final start = boundaries[i].round().clamp(0, values.length - 1);
+      final end = boundaries[i + 1].round().clamp(start, values.length);
+      if (end - start < 3) continue;
+      double eMin = values[start], eMax = values[start];
       for (int j = start + 1; j < end; j++) {
-        if (p.values[j] < eMin) eMin = p.values[j];
-        if (p.values[j] > eMax) eMax = p.values[j];
+        if (values[j] < eMin) eMin = values[j];
+        if (values[j] > eMax) eMax = values[j];
       }
       final ern = eMax - eMin;
       if (ern > maxERN) maxERN = ern;
     }
+    return range > 0 ? (maxERN / range).clamp(0.0, 1.0) : 1.0;
+  }
 
-    final def = range > 0 ? (maxERN / range).clamp(0.0, 1.0) : 1.0;
+  GradeValue _defGradeValue(double def, String basis) {
     ISOGrade g;
     if (def <= 0.15) g = ISOGrade.A;
     else if (def <= 0.20) g = ISOGrade.B;
@@ -250,7 +253,64 @@ class ISO15416Analyzer {
     else if (def <= 0.30) g = ISOGrade.D;
     else g = ISOGrade.F;
     return GradeValue(rawMeasurement: def, unit: 'ratio', grade: g,
-      numericGrade: g.numeric, isEstimated: true, estimationBasis: '~Cámara');
+      numericGrade: g.numeric, isEstimated: true, estimationBasis: basis);
+  }
+
+  // Multi-row DEF: scans every row across the barcode height and returns the
+  // worst-case DEF. Catches smears and voids that the single best row misses.
+  GradeValue? _calcDEFMultiRow(BarcodeAnalysisInput input) {
+    final bytes = input.imageBytes;
+    if (bytes == null) return null;
+
+    final W = input.captureSize.width.round();
+    final H = input.captureSize.height.round();
+    if (W <= 0 || H <= 0) return null;
+
+    // Only NV21 — JPEG gives unreliable per-pixel values.
+    if (bytes.length > 3 &&
+        bytes[0] == 0xFF && bytes[1] == 0xD8 && bytes[2] == 0xFF) return null;
+    if (bytes.length < W * H) return null;
+
+    final bb = input.boundingBox;
+    if (bb == null || bb.width < 20) return null;
+
+    // ROI: tight to barcode bounding box (no padding) so we measure the symbol itself.
+    final x0 = bb.left.toInt().clamp(0, W - 1);
+    final x1 = bb.right.toInt().clamp(x0 + 1, W);
+    final y0 = bb.top.toInt().clamp(0, H - 1);
+    final y1 = bb.bottom.toInt().clamp(y0 + 1, H);
+    final roiW = x1 - x0;
+    if (roiW < 20 || y1 - y0 < 3) return null;
+
+    double worstDEF = 0.0;
+    int rowsAnalyzed = 0;
+    const rowStep = 2;
+
+    for (int y = y0; y < y1; y += rowStep) {
+      final base = y * W + x0;
+      if (base + roiW > bytes.length) continue;
+
+      final rowVals = List<double>.filled(roiW, 0.0);
+      double rMax = 0.0, rMin = 1.0;
+      for (int x = 0; x < roiW; x++) {
+        final v = bytes[base + x] / 255.0;
+        rowVals[x] = v;
+        if (v > rMax) rMax = v;
+        if (v < rMin) rMin = v;
+      }
+      final range = rMax - rMin;
+      if (range < 0.15) continue; // not enough contrast — skip (e.g. background rows)
+
+      final edges = _detectEdges(rowVals, rMax, rMin);
+      if (edges.length < 4) continue;
+
+      final def = _defValueFromProfile(rowVals, edges, range);
+      if (def > worstDEF) worstDEF = def;
+      rowsAnalyzed++;
+    }
+
+    if (rowsAnalyzed < 2) return null;
+    return _defGradeValue(worstDEF, '~Cámara (multi-fila)');
   }
 
   List<_Edge> _detectEdges(List<double> profile, double rMax, double rMin) {
@@ -288,19 +348,97 @@ class ISO15416Analyzer {
         isEstimated: true, estimationBasis: 'Sin datos de posición del símbolo',
       );
     }
+
+    // Size check: quiet zone in modules
     final leftQZ = bb.left;
     final rightQZ = input.captureSize.width - bb.right;
     final minQZ = leftQZ < rightQZ ? leftQZ : rightQZ;
     final modW = bb.width > 0 ? bb.width / _expectedModuleCount(input.symbology) : 1.0;
     final qzMods = modW > 0 ? minQZ / modW : 0.0;
     final req = _requiredQuietZone(input.symbology);
-    ISOGrade g;
-    if (qzMods >= req) g = ISOGrade.A;
-    else if (qzMods >= req * 0.8) g = ISOGrade.B;
-    else if (qzMods >= req * 0.6) g = ISOGrade.C;
-    else if (qzMods >= req * 0.4) g = ISOGrade.D;
-    else g = ISOGrade.F;
-    return GradeValue(rawMeasurement: qzMods, unit: 'X', grade: g, numericGrade: g.numeric);
+    ISOGrade sizeGrade;
+    if (qzMods >= req) sizeGrade = ISOGrade.A;
+    else if (qzMods >= req * 0.8) sizeGrade = ISOGrade.B;
+    else if (qzMods >= req * 0.6) sizeGrade = ISOGrade.C;
+    else if (qzMods >= req * 0.4) sizeGrade = ISOGrade.D;
+    else sizeGrade = ISOGrade.F;
+
+    // Contamination check: dark pixels in the quiet zone area (ink smears, fingerprints).
+    // The quiet zone must be white — any significant dark area degrades the grade.
+    final contamGrade = _checkQZContamination(input, bb, modW);
+    final worst = (contamGrade != null && contamGrade.numeric < sizeGrade.numeric)
+        ? contamGrade
+        : sizeGrade;
+
+    final isContaminated = contamGrade != null && contamGrade.numeric < sizeGrade.numeric;
+    return GradeValue(
+      rawMeasurement: qzMods, unit: 'X', grade: worst,
+      numericGrade: worst.numeric,
+      isEstimated: isContaminated,
+      estimationBasis: isContaminated ? 'Contaminación en zona silenciosa' : null,
+    );
+  }
+
+  // Checks pixel darkness in the left/right quiet zones using NV21 Y-plane.
+  // Returns the contamination grade (A=clean … F=heavily contaminated), or null
+  // if image data is unavailable.
+  ISOGrade? _checkQZContamination(
+      BarcodeAnalysisInput input, Rect bb, double modW) {
+    final bytes = input.imageBytes;
+    if (bytes == null) return null;
+
+    final W = input.captureSize.width.round();
+    final H = input.captureSize.height.round();
+    if (W <= 0 || H <= 0) return null;
+
+    // Only NV21
+    if (bytes.length > 3 &&
+        bytes[0] == 0xFF && bytes[1] == 0xD8 && bytes[2] == 0xFF) return null;
+    if (bytes.length < W * H) return null;
+
+    // Sample a strip of pixels the width of 2 modules inside the quiet zone,
+    // vertically aligned with the barcode rows.
+    final sampleW = (modW * 2).round().clamp(4, 40);
+    final y0 = bb.top.toInt().clamp(0, H - 1);
+    final y1 = bb.bottom.toInt().clamp(y0 + 1, H);
+
+    final lx0 = (bb.left.toInt() - sampleW).clamp(0, W - 1);
+    final lx1 = bb.left.toInt().clamp(lx0 + 1, W);
+    final rx0 = bb.right.toInt().clamp(0, W - 1);
+    final rx1 = (bb.right.toInt() + sampleW).clamp(rx0 + 1, W);
+
+    if (lx1 - lx0 < 2 && rx1 - rx0 < 2) return null;
+
+    int total = 0, dark = 0;
+    const step = 2;
+    // Pixel is "dark" (contamination) if luminance < 50% (128/255).
+    // Normal white label paper: Y ≈ 200-240. Ink smear: Y ≈ 20-80.
+    const darkThreshold = 128;
+
+    for (int y = y0; y < y1; y += step) {
+      final rowBase = y * W;
+      for (int x = lx0; x < lx1; x += step) {
+        final idx = rowBase + x;
+        if (idx >= bytes.length) continue;
+        total++;
+        if (bytes[idx] < darkThreshold) dark++;
+      }
+      for (int x = rx0; x < rx1; x += step) {
+        final idx = rowBase + x;
+        if (idx >= bytes.length) continue;
+        total++;
+        if (bytes[idx] < darkThreshold) dark++;
+      }
+    }
+
+    if (total < 10) return null;
+    final ratio = dark / total;
+
+    if (ratio <= 0.05) return ISOGrade.A;  // < 5%: zona limpia
+    if (ratio <= 0.12) return ISOGrade.B;  // 5-12%: leve contaminación
+    if (ratio <= 0.22) return ISOGrade.C;  // 12-22%: contaminación notable
+    if (ratio <= 0.38) return ISOGrade.D;  // 22-38%: contaminación significativa
+    return ISOGrade.F;                      // > 38%: zona severamente contaminada
   }
 
   // ── Conservative fallback ─────────────────────────────────────────────────
