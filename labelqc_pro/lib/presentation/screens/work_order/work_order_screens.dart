@@ -1,6 +1,5 @@
+import 'dart:async';
 import 'dart:convert';
-import 'dart:typed_data';
-import 'dart:ui';
 import 'package:flutter/material.dart';
 import 'package:flutter/services.dart';
 import 'package:go_router/go_router.dart';
@@ -10,8 +9,7 @@ import '../../../core/theme/app_theme.dart';
 import '../../widgets/common/widgets.dart';
 import '../../../domain/entities/entities.dart';
 import '../../../data/datasources/local/database/app_database.dart';
-import '../../../services/iso/iso_analyzers.dart';
-import '../../../services/iso/nv21_utils.dart';
+import '../../../services/iso/analysis_engine.dart';
 import '../../../services/spc/spc_and_recommendations.dart';
 import '../../../injection.dart';
 import '../../../services/pdf/of_pdf_generator.dart';
@@ -356,17 +354,17 @@ class WorkOrderScanScreen extends StatefulWidget {
   State<WorkOrderScanScreen> createState() => _WorkOrderScanScreenState();
 }
 
-class _WorkOrderScanScreenState extends State<WorkOrderScanScreen>
-    with NV21Utils {
+class _WorkOrderScanScreenState extends State<WorkOrderScanScreen> {
   final _db = getIt<AppDatabase>();
-  final _analyzer1D = getIt<ISO15416Analyzer>();
-  final _analyzer2D = getIt<ISO15415Analyzer>();
+  final _engine = getIt<BarcodeAnalysisEngine>();
   final _recEngine = getIt<RecommendationEngine>();
 
   late final MobileScannerController _scanner;
   bool _torchOn = false;
   bool _isAnalyzing = false;
   String? _lastScannedId;
+  Timer? _debounceTimer;
+  BarcodeCapture? _pendingCapture;
 
   Map<String, dynamic>? _workOrder;
   List<BarcodeVerification> _history = [];
@@ -390,6 +388,7 @@ class _WorkOrderScanScreenState extends State<WorkOrderScanScreen>
 
   @override
   void dispose() {
+    _debounceTimer?.cancel();
     _scanner.dispose();
     super.dispose();
   }
@@ -427,7 +426,7 @@ class _WorkOrderScanScreenState extends State<WorkOrderScanScreen>
 
   bool _isAcceptable(ISOGrade grade) => grade.numeric >= _minGrade.numeric;
 
-  void _onDetect(BarcodeCapture capture) async {
+  void _onDetect(BarcodeCapture capture) {
     if (_isAnalyzing) return;
     final barcode = capture.barcodes.firstOrNull;
     if (barcode == null || barcode.rawValue == null) return;
@@ -437,56 +436,43 @@ class _WorkOrderScanScreenState extends State<WorkOrderScanScreen>
     if (newId == _lastScannedId) return;
     _lastScannedId = newId;
 
+    _pendingCapture = capture;
+    _debounceTimer?.cancel();
+    _debounceTimer =
+        Timer(const Duration(milliseconds: 300), _analyzeCapture);
+  }
+
+  Future<void> _analyzeCapture() async {
+    final capture = _pendingCapture;
+    if (capture == null || _isAnalyzing || !mounted) return;
+    final barcode = capture.barcodes.firstOrNull;
+    if (barcode == null || barcode.rawValue == null) return;
+
     setState(() => _isAnalyzing = true);
     try {
       final type = _mapFormat(barcode.format);
 
-      // NV21 orientation crop — same fix as production mode.
-      final rawImage = capture.image;
-      final displayBB = _cornersToRect(barcode.corners);
-      final BarcodeAnalysisInput input;
+      final result = _engine.analyze(
+        rawBytes: capture.image,
+        captureSize: capture.size,
+        corners: barcode.corners,
+        rawValue: barcode.rawValue,
+        symbology: type,
+      );
 
-      if (rawImage != null && !nv21IsJpeg(rawImage)) {
-        final layout = nv21ResolveLayout(rawImage, capture.size, displayBB);
-        final crop = nv21CropBarcode(rawImage, layout.$1, layout.$2, layout.$3);
-        if (crop != null) {
-          input = BarcodeAnalysisInput(
-            rawValue: barcode.rawValue,
-            symbology: type,
-            corners: barcode.corners,
-            boundingBox: Rect.fromLTWH(0, 0, crop.$2.width, crop.$2.height),
-            captureSize: crop.$2,
-            imageBytes: crop.$1,
-          );
-        } else {
-          input = BarcodeAnalysisInput(
-            rawValue: barcode.rawValue,
-            symbology: type,
-            corners: barcode.corners,
-            boundingBox: displayBB,
-            captureSize: capture.size,
-            imageBytes: rawImage,
-          );
-        }
-      } else {
-        input = BarcodeAnalysisInput(
-          rawValue: barcode.rawValue,
-          symbology: type,
-          corners: barcode.corners,
-          boundingBox: displayBB,
-          captureSize: capture.size,
-          imageBytes: rawImage,
-        );
+      if (result.isRepetir) {
+        // Frame no analizable: continúa escaneando automáticamente.
+        if (mounted) setState(() => _isAnalyzing = false);
+        return;
       }
 
-      final params = type.is2D
-          ? _analyzer2D.analyze(input)
-          : _analyzer1D.analyze(input);
+      final params = result.parameters!;
+      final grade = result.overallGrade!;
       final recs = _recEngine.generate(
         verification: BarcodeVerification(
           id: '', timestamp: DateTime.now(), symbology: type,
           decodedValue: barcode.rawValue!, standard: type.standard,
-          parameters: params, overallGrade: params.overallGrade,
+          parameters: params, overallGrade: grade,
           captureMode: OperatorMode.workOrder,
         ),
         printSystem: _printSystem,
@@ -498,7 +484,7 @@ class _WorkOrderScanScreenState extends State<WorkOrderScanScreen>
         decodedValue: barcode.rawValue!,
         standard: type.standard,
         parameters: params,
-        overallGrade: params.overallGrade,
+        overallGrade: grade,
         capturedImage: capture.image,
         captureMode: OperatorMode.workOrder,
         workOrderId: widget.workOrderId,
@@ -523,18 +509,7 @@ class _WorkOrderScanScreenState extends State<WorkOrderScanScreen>
     }
   }
 
-  Rect? _cornersToRect(List<Offset>? corners) {
-    if (corners == null || corners.isEmpty) return null;
-    double minX = corners[0].dx, maxX = corners[0].dx;
-    double minY = corners[0].dy, maxY = corners[0].dy;
-    for (final c in corners) {
-      if (c.dx < minX) minX = c.dx;
-      if (c.dx > maxX) maxX = c.dx;
-      if (c.dy < minY) minY = c.dy;
-      if (c.dy > maxY) maxY = c.dy;
-    }
-    return Rect.fromLTRB(minX, minY, maxX, maxY);
-  }
+
 
   BarcodeType _mapFormat(BarcodeFormat f) {
     switch (f) {

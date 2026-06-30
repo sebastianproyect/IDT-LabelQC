@@ -178,22 +178,25 @@ class ISOParameters extends Equatable {
         if (printGrowth != null) printGrowth!,
       ];
 
-  /// Overall grade uses only parameters reliably measurable from a phone camera:
-  ///   · Symbol Contrast  — Michelson contrast from NV21 Y-plane, real value
-  ///   · Decodability     — binary (decoded or not), 100% reliable
-  ///   · Defects          — only when computed from actual image pixels
+  /// Parameters that determine pass/fail (measured from image, not estimated).
+  /// SC is included when estimationBasis == null (real NV21 measurement).
+  /// DEF is included when estimationBasis starts with '~Cámara' (real pixels).
+  /// Decodability is always included (100% reliable).
   ///
-  /// EC, MOD, MR, QZ and geometric params are calculated and displayed for
-  /// diagnostics but do NOT determine pass/fail — camera estimates of those
-  /// parameters produce too many false rejects on visually clean barcodes.
-  ///
-  /// DEF is excluded when estimationBasis does NOT start with '~Cámara',
-  /// which means the analyzer fell back to a conservative guess (no image).
+  /// Use this list for root-cause display and verdict logic.
+  List<GradeValue> get verdictValues {
+    final v = <GradeValue>[decodability];
+    if (symbolContrast.estimationBasis == null) v.add(symbolContrast);
+    if (defects.estimationBasis?.startsWith('~Cámara') == true) v.add(defects);
+    return v;
+  }
+
+  /// Overall grade considers only parameters measurable from a phone camera.
+  /// Estimated parameters (EC, MOD, MR, QZ, geometric) are shown diagnostically
+  /// but do NOT determine pass/fail — they produce too many false rejects.
   ISOGrade get overallGrade {
-    final votes = <GradeValue>[symbolContrast, decodability];
-    if (defects.estimationBasis?.startsWith('~Cámara') == true) {
-      votes.add(defects);
-    }
+    final votes = verdictValues;
+    if (votes.isEmpty) return ISOGrade.F;
     return ISOGrade.worst(votes.map((v) => v.grade).toList());
   }
 
@@ -591,4 +594,143 @@ class SPCResult extends Equatable {
 
   @override
   List<Object?> get props => [trend, mean, violations];
+}
+
+// ══════════════════════════════════════════════════════════
+// ANALYSIS ENGINE RESULT TYPES
+// ══════════════════════════════════════════════════════════
+
+/// Veredicto final del motor de análisis.
+enum AnalysisVerdict {
+  /// Código analizado y cumple calidad mínima (≥ Grade C).
+  pasa,
+  /// Código analizado y NO cumple calidad mínima.
+  noPasa,
+  /// No se pudo analizar con suficiente confianza. Operario debe repetir captura.
+  repetirCaptura,
+}
+
+/// Causa física probable del fallo (para mostrar al operario).
+enum FailCause {
+  bajoContraste,       // SC bajo → ribbon agotado / cabezal sin tinta
+  manchaContaminacion, // DEF · spot → temperatura alta / cabezal sucio
+  barrasDanadas,       // DEF · barras-rotas → daño estructural
+  rotulador,           // DEF · contaminación → rayón o mancha externa
+  noDecodificado,      // Decodability F → código ilegible
+  imagenInsuficiente,  // Imagen analizable pero métricas límite
+}
+
+/// Motivo por el que se pide "Repetir captura".
+enum RepeatReason {
+  sinImagen,             // sin bytes NV21 o imagen JPEG (no analizable)
+  cropDemasiadoPequeno,  // el código está muy lejos → acercar teléfono
+  imagenOscura,          // poca luz → mejorar iluminación
+  bajoContrastePared,    // código y fondo tienen el mismo tono
+  pocasTransiciones,     // no se detectan barras/espacios → mejorar enfoque
+  pocasFilas,            // crop demasiado alto/estrecho → acercar teléfono
+  imagenBorrosa,         // gradiente insuficiente → estabilizar teléfono
+}
+
+/// Evidencia trazable del análisis: región, frame, métricas raw.
+/// Permite responder "¿por qué no es un resultado inventado?".
+class AnalysisEvidence {
+  // ── Frame metadata ───────────────────────────────────────────────────────
+  final bool isNV21;                   // false = JPEG o sin imagen
+  final int nativeW;                   // ancho real del frame NV21
+  final int nativeH;                   // alto real del frame NV21
+  final bool wasOrientationCorrected;  // true = sensor landscape detectado
+
+  // ── Región analizada (en coordenadas NV21 nativas) ───────────────────────
+  final int? cropX0, cropY0, cropW, cropH;
+
+  // ── Métricas del frame antes del análisis ISO ────────────────────────────
+  final double? cropContrast;    // rMax - rMin del crop (0-1)
+  final int? bestTransitions;    // transiciones en la mejor fila del crop
+  final int? barcodeRows;        // filas de barcode válidas encontradas
+
+  // ── Valores ISO medidos (raw, sin gradear) ───────────────────────────────
+  final double? scRaw;              // Symbol Contrast medido (0-100%)
+  final double? defRaw;             // DEF medido (0-1, menor = mejor)
+  final String? defEstimationBasis; // '~Cámara · void/spot/barras-rotas' o null
+
+  const AnalysisEvidence({
+    required this.isNV21,
+    required this.nativeW,
+    required this.nativeH,
+    this.wasOrientationCorrected = false,
+    this.cropX0,
+    this.cropY0,
+    this.cropW,
+    this.cropH,
+    this.cropContrast,
+    this.bestTransitions,
+    this.barcodeRows,
+    this.scRaw,
+    this.defRaw,
+    this.defEstimationBasis,
+  });
+
+  /// Texto de debug para logs.
+  String get debugSummary =>
+      'NV21=${nativeW}x$nativeH orient=${wasOrientationCorrected ? "corr" : "ok"} '
+      'crop=${cropW ?? "?"}x${cropH ?? "?"} '
+      'contrast=${cropContrast?.toStringAsFixed(2) ?? "?"} '
+      'trans=${bestTransitions ?? "?"} rows=${barcodeRows ?? "?"} '
+      'SC=${scRaw?.toStringAsFixed(1) ?? "?"}% DEF=${defRaw?.toStringAsFixed(3) ?? "?"}';
+}
+
+/// Resultado completo del BarcodeAnalysisEngine.
+/// Cada resultado incluye evidencia que justifica por qué no es inventado.
+class AnalysisResult {
+  final AnalysisVerdict verdict;
+  final ISOParameters? parameters;   // null si REPETIR
+  final ISOGrade? overallGrade;      // null si REPETIR
+  final FailCause? failCause;        // causa del fallo (null si PASA o REPETIR)
+  final RepeatReason? repeatReason;  // motivo del repetir (null si PASA/NO_PASA)
+  final AnalysisEvidence evidence;
+
+  const AnalysisResult({
+    required this.verdict,
+    required this.evidence,
+    this.parameters,
+    this.overallGrade,
+    this.failCause,
+    this.repeatReason,
+  });
+
+  bool get isPasa => verdict == AnalysisVerdict.pasa;
+  bool get isNoPasa => verdict == AnalysisVerdict.noPasa;
+  bool get isRepetir => verdict == AnalysisVerdict.repetirCaptura;
+
+  /// Mensaje corto para mostrar al operario cuando se pide repetir.
+  String get repeatMessage {
+    switch (repeatReason) {
+      case RepeatReason.sinImagen:
+        return 'Sin imagen de cámara — reintentar';
+      case RepeatReason.cropDemasiadoPequeno:
+        return 'Acerque el teléfono al código';
+      case RepeatReason.imagenOscura:
+        return 'Mejore la iluminación';
+      case RepeatReason.bajoContrastePared:
+        return 'Código y fondo muy similares — limpie la etiqueta';
+      case RepeatReason.pocasTransiciones:
+        return 'Enfoque bien el código';
+      case RepeatReason.pocasFilas:
+        return 'Acerque el teléfono al código';
+      case RepeatReason.imagenBorrosa:
+        return 'Mantenga el teléfono estable';
+      default:
+        return 'Repetir captura';
+    }
+  }
+
+  factory AnalysisResult.repetir(
+    RepeatReason reason, {
+    required AnalysisEvidence evidence,
+  }) =>
+      AnalysisResult(
+        verdict: AnalysisVerdict.repetirCaptura,
+        repeatReason: reason,
+        evidence: evidence,
+      );
 }

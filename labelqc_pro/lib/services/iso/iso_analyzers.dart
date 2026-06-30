@@ -355,6 +355,7 @@ class ISO15416Analyzer {
 
     // ── Pass 1: inventory all barcode rows ────────────────────────────────────
     double globalRange = 0.0;
+    double globalRMax = 0.0; // brightest pixel across all barcode rows
     int bestTransitions = 0;
     final rowSummaries = <_RowSummary>[];
 
@@ -385,6 +386,7 @@ class ISO15416Analyzer {
       if (transitions < minBarcodeTransitions) continue;
 
       if (range > globalRange) globalRange = range;
+      if (rMax > globalRMax) globalRMax = rMax; // track brightest space pixel
       if (transitions > bestTransitions) bestTransitions = transitions;
       rowSummaries.add(_RowSummary(y: y, rMax: rMax, rMin: rMin,
           transitions: transitions));
@@ -429,8 +431,13 @@ class ISO15416Analyzer {
       // Marker/rotulador ink creates dark pixels within space elements that
       // should be bright. ERN alone underdetects diagonal marks because a
       // diagonal line crosses each element at only one point.
-      // Threshold 0.38: below this inside a space element = contamination.
-      const contamThreshold = 0.38;
+      //
+      // Threshold is RELATIVE to globalRMax (the brightest space pixel found
+      // in any barcode row). This adapts to ambient illumination automatically:
+      // low light → rMax≈0.65 → threshold≈0.29 (40% of rMax)
+      // bright env → rMax≈0.95 → threshold≈0.43 (45% of rMax)
+      // A pixel below 40-45% of the brightest space is contamination.
+      final contamThreshold = globalRMax * 0.45;
       double worstContamSeverity = 0.0;
 
       for (int i = 0; i < boundaries.length - 1; i++) {

@@ -1,16 +1,15 @@
-import 'dart:typed_data';
-import 'dart:ui';
+import 'dart:async';
 import 'package:flutter/material.dart';
 import 'package:flutter/services.dart';
 import 'package:mobile_scanner/mobile_scanner.dart' hide BarcodeType;
 import 'package:go_router/go_router.dart';
 import '../../../core/theme/app_theme.dart';
-import '../../../services/iso/nv21_utils.dart';
 import '../../widgets/common/widgets.dart';
 import '../../../domain/entities/entities.dart';
-import '../../../services/iso/iso_analyzers.dart';
+import '../../../services/iso/analysis_engine.dart';
 import '../../../services/spc/spc_and_recommendations.dart';
 import '../../../services/pdf/pdf_generator.dart';
+import '../../../injection.dart';
 
 // ════════════════════════════════════════════
 // TECHNICAL SCAN SCREEN
@@ -23,8 +22,7 @@ class TechnicalScanScreen extends StatefulWidget {
   State<TechnicalScanScreen> createState() => _TechnicalScanScreenState();
 }
 
-class _TechnicalScanScreenState extends State<TechnicalScanScreen>
-    with NV21Utils {
+class _TechnicalScanScreenState extends State<TechnicalScanScreen> {
   final MobileScannerController _scanner = MobileScannerController(
     detectionSpeed: DetectionSpeed.noDuplicates,
     facing: CameraFacing.back,
@@ -32,20 +30,36 @@ class _TechnicalScanScreenState extends State<TechnicalScanScreen>
     returnImage: true,
   );
 
+  final BarcodeAnalysisEngine _engine = getIt<BarcodeAnalysisEngine>();
+  final RecommendationEngine _recEngine = getIt<RecommendationEngine>();
+
   bool _torchOn = false;
   bool _isAnalyzing = false;
-  final ISO15415Analyzer _analyzer2D = ISO15415Analyzer();
-  final ISO15416Analyzer _analyzer1D = ISO15416Analyzer();
-  final RecommendationEngine _recEngine = RecommendationEngine();
+
+  // Debounce: espera 300ms desde la última detección antes de analizar.
+  // Esto garantiza que el frame analizado no sea borroso (auto-focus ya asentado).
+  Timer? _debounceTimer;
+  BarcodeCapture? _pendingCapture;
 
   @override
   void dispose() {
+    _debounceTimer?.cancel();
     _scanner.dispose();
     super.dispose();
   }
 
-  void _onDetect(BarcodeCapture capture) async {
+  void _onDetect(BarcodeCapture capture) {
     if (_isAnalyzing) return;
+    if (capture.barcodes.firstOrNull?.rawValue == null) return;
+    _pendingCapture = capture;
+    _debounceTimer?.cancel();
+    _debounceTimer =
+        Timer(const Duration(milliseconds: 300), _analyzeCapture);
+  }
+
+  Future<void> _analyzeCapture() async {
+    final capture = _pendingCapture;
+    if (capture == null || _isAnalyzing || !mounted) return;
     final barcode = capture.barcodes.firstOrNull;
     if (barcode?.rawValue == null) return;
 
@@ -53,66 +67,42 @@ class _TechnicalScanScreenState extends State<TechnicalScanScreen>
     HapticFeedback.mediumImpact();
 
     try {
-      final barcode0 = barcode!;
-      final type = _mapFormat(barcode0.format);
+      final type = _mapFormat(barcode!.format);
 
-      // NV21 orientation crop — same fix as production mode.
-      final rawImage = capture.image;
-      final displayBB = _cornersToRect(barcode0.corners);
-      final BarcodeAnalysisInput input;
+      final result = _engine.analyze(
+        rawBytes: capture.image,
+        captureSize: capture.size,
+        corners: barcode.corners,
+        rawValue: barcode.rawValue,
+        symbology: type,
+      );
 
-      if (rawImage != null && !nv21IsJpeg(rawImage)) {
-        final layout = nv21ResolveLayout(rawImage, capture.size, displayBB);
-        final crop = nv21CropBarcode(rawImage, layout.$1, layout.$2, layout.$3);
-        if (crop != null) {
-          input = BarcodeAnalysisInput(
-            rawValue: barcode0.rawValue,
-            symbology: type,
-            corners: barcode0.corners,
-            boundingBox: Rect.fromLTWH(0, 0, crop.$2.width, crop.$2.height),
-            captureSize: crop.$2,
-            imageBytes: crop.$1,
-          );
-        } else {
-          input = BarcodeAnalysisInput(
-            rawValue: barcode0.rawValue,
-            symbology: type,
-            corners: barcode0.corners,
-            boundingBox: displayBB,
-            captureSize: capture.size,
-            imageBytes: rawImage,
-          );
-        }
-      } else {
-        input = BarcodeAnalysisInput(
-          rawValue: barcode0.rawValue,
-          symbology: type,
-          corners: barcode0.corners,
-          boundingBox: displayBB,
-          captureSize: capture.size,
-          imageBytes: rawImage,
-        );
+      if (result.isRepetir) {
+        // Frame no analizable: simplemente reinicia (auto-scan volverá a detectar).
+        if (mounted) setState(() => _isAnalyzing = false);
+        return;
       }
 
-      final params = type.is2D
-          ? _analyzer2D.analyze(input)
-          : _analyzer1D.analyze(input);
+      final params = result.parameters!;
+      final grade = result.overallGrade!;
 
-      final recs = _recEngine.generate(verification: BarcodeVerification(
-        id: '', timestamp: DateTime.now(), symbology: type,
-        decodedValue: barcode0.rawValue!, standard: type.standard,
-        parameters: params, overallGrade: params.overallGrade,
-        captureMode: OperatorMode.technical,
-      ));
+      final recs = _recEngine.generate(
+        verification: BarcodeVerification(
+          id: '', timestamp: DateTime.now(), symbology: type,
+          decodedValue: barcode.rawValue!, standard: type.standard,
+          parameters: params, overallGrade: grade,
+          captureMode: OperatorMode.technical,
+        ),
+      );
 
       final verification = BarcodeVerification(
         id: DateTime.now().millisecondsSinceEpoch.toString(),
         timestamp: DateTime.now(),
         symbology: type,
-        decodedValue: barcode0.rawValue!,
+        decodedValue: barcode.rawValue!,
         standard: type.standard,
         parameters: params,
-        overallGrade: params.overallGrade,
+        overallGrade: grade,
         capturedImage: capture.image,
         captureMode: OperatorMode.technical,
         recommendations: recs,
@@ -122,22 +112,9 @@ class _TechnicalScanScreenState extends State<TechnicalScanScreen>
         setState(() => _isAnalyzing = false);
         context.push('/technical/result', extra: verification);
       }
-    } catch (e) {
+    } catch (_) {
       if (mounted) setState(() => _isAnalyzing = false);
     }
-  }
-
-  Rect? _cornersToRect(List<Offset>? corners) {
-    if (corners == null || corners.isEmpty) return null;
-    double minX = corners[0].dx, maxX = corners[0].dx;
-    double minY = corners[0].dy, maxY = corners[0].dy;
-    for (final c in corners) {
-      if (c.dx < minX) minX = c.dx;
-      if (c.dx > maxX) maxX = c.dx;
-      if (c.dy < minY) minY = c.dy;
-      if (c.dy > maxY) maxY = c.dy;
-    }
-    return Rect.fromLTRB(minX, minY, maxX, maxY);
   }
 
   BarcodeType _mapFormat(BarcodeFormat f) {
